@@ -18,7 +18,10 @@ from common.protocol import (
     decode_document,
     encode_message,
     validate_directory,
+    validate_message,
     validate_response,
+    validate_room,
+    validate_sync_response,
     validate_user,
 )
 
@@ -67,6 +70,7 @@ class NetworkClient(threading.Thread):
                     return
                 self.events.put(("connected", None))
                 request_id = 0
+                user_id = None
                 while not self._stopping.is_set():
                     command = self.requests.get()
                     if command is None or self._stopping.is_set():
@@ -80,9 +84,22 @@ class NetworkClient(threading.Thread):
                     })
                     if response is not None:
                         if action == "login" and response["ok"]:
-                            validate_user(response["data"].get("user"))
+                            user_id = validate_user(response["data"].get("user"))["id"]
                         elif action == "get_directory" and response["ok"]:
                             validate_directory(response["data"])
+                        elif action == "logout" and response["ok"]:
+                            user_id = None
+                        elif action == "open_private" and response["ok"]:
+                            room = validate_room(response["data"].get("room"))
+                            if ({member["id"] for member in room["members"]} != {user_id, payload["target_user_id"]}
+                                    or type(response["data"].get("created")) is not bool):
+                                raise ProtocolError("INVALID_RESPONSE", "Private room has unexpected participants")
+                        elif action == "send_message" and response["ok"]:
+                            message = validate_message(response["data"].get("message"), payload["room_key"])
+                            if message["sender"]["id"] != user_id:
+                                raise ProtocolError("INVALID_RESPONSE", "Message acknowledgement has an unexpected sender")
+                        elif action == "sync_room" and response["ok"]:
+                            validate_sync_response(response["data"], payload)
                         self.events.put(("response", response))
         except (OSError, ProtocolError, FrameTooLarge, ValueError) as exc:
             if not self._stopping.is_set():

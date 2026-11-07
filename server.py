@@ -25,9 +25,13 @@ from common.protocol import (
     read_request_id,
     success_response,
     validate_envelope,
+    validate_content,
+    validate_id,
+    validate_room_key,
+    validate_sync_request,
     validate_username,
 )
-from database import get_or_create_user, open_database
+from database import get_or_create_user, open_database, open_private, send_message, sync_room
 
 LOGGER = logging.getLogger("socket_chat.server")
 _STOP = object()
@@ -373,7 +377,7 @@ class ChatServer:
         """Only the central worker calls application handlers."""
         if request.action not in KNOWN_ACTIONS:
             return error_response(request.request_id, "UNKNOWN_ACTION", "Unknown action")
-        if request.action not in {"ping", "login", "logout", "get_directory"}:
+        if request.action not in {"ping", "login", "logout", "get_directory", "open_private", "send_message", "sync_room"}:
             return error_response(
                 request.request_id,
                 "ACTION_NOT_IMPLEMENTED",
@@ -389,9 +393,9 @@ class ChatServer:
             session.user = get_or_create_user(self._database, username)
             self._sessions.add(session)
             return success_response(request.request_id, {"user": session.user})
-        if request.action == "get_directory" and session.user is None:
-            raise ProtocolError("UNAUTHENTICATED", "Join with a username before requesting the directory")
-        if request.payload:
+        if request.action not in {"ping", "logout"} and session.user is None:
+            raise ProtocolError("UNAUTHENTICATED", "Join with a username before using this action")
+        if request.action in {"ping", "logout", "get_directory"} and request.payload:
             raise ProtocolError("INVALID_PAYLOAD", f"{request.action} requires an empty payload")
         if request.action == "logout":
             self._sessions.discard(session)
@@ -402,6 +406,20 @@ class ChatServer:
             online_users = sorted(users.values(), key=lambda user: (user["username"].lower(), user["id"]))
             # No groups exist yet; create_group remains explicitly unimplemented.
             return success_response(request.request_id, {"online_users": online_users, "groups": []})
+        if request.action == "open_private":
+            if set(request.payload) != {"target_user_id"}:
+                raise ProtocolError("INVALID_PAYLOAD", "open_private requires only target_user_id")
+            target = validate_id(request.payload["target_user_id"], "target_user_id")
+            return success_response(request.request_id, open_private(self._database, session.user["id"], target))
+        if request.action == "send_message":
+            if set(request.payload) != {"room_key", "content"}:
+                raise ProtocolError("INVALID_PAYLOAD", "send_message requires room_key and content")
+            room_key = validate_room_key(request.payload["room_key"])
+            content = validate_content(request.payload["content"])
+            return success_response(request.request_id, send_message(self._database, room_key, session.user["id"], content))
+        if request.action == "sync_room":
+            validate_sync_request(request.payload)
+            return success_response(request.request_id, sync_room(self._database, session.user["id"], request.payload))
         return success_response(request.request_id, {"pong": True})
 
     # Run on the server I/O thread assigned to this client and encode its response.

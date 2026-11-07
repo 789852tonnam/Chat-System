@@ -8,6 +8,7 @@ from unittest.mock import patch
 from client_network import NetworkClient
 from common.protocol import MAX_RESPONSE_BYTES, encode_message
 from server import ChatServer, ServerConfig
+from test_chat import ChatPeer, initial_sync
 
 
 class ClientNetworkTests(unittest.TestCase):
@@ -197,3 +198,45 @@ class ClientNetworkTests(unittest.TestCase):
         client.requests.put(("ping", {}))
         self.assertIn("timed out", self.event(client, "error"))
         self.event(client, "disconnected")
+
+    def test_private_chat_requests_validate_room_message_and_history(self):
+        server = self.server()
+        with ChatPeer(server.address, "Bob") as bob:
+            client = self.client(server)
+            client.requests.put(("login", {"username": "Alice"}))
+            self.event(client, "response")
+            client.requests.put(("open_private", {"target_user_id": bob.user["id"]}))
+            room = self.event(client, "response")["data"]["room"]
+            client.requests.put(("send_message", {"room_key": room["room_key"], "content": "Network chat"}))
+            message = self.event(client, "response")["data"]["message"]
+            client.requests.put(("sync_room", initial_sync(room["room_key"])))
+            self.assertEqual(self.event(client, "response")["data"]["older_messages"], [message])
+
+    def test_malformed_chat_responses_close_connection(self):
+        for broken in ["open_private", "send_message", "sync_room"]:
+            with self.subTest(action=broken):
+                class InvalidChatServer(ChatServer):
+                    def _handle_request(self, request, session):
+                        response = super()._handle_request(request, session)
+                        if request.action == broken and response["ok"]:
+                            if broken == "open_private":
+                                response["data"]["room"]["room_key"] = "private:1:999"
+                            elif broken == "send_message":
+                                response["data"]["message"]["content"] = None
+                            else:
+                                response["data"]["latest_id"] = 999
+                        return response
+
+                server = self.server(InvalidChatServer)
+                with ChatPeer(server.address, "Bob") as bob:
+                    client = self.client(server)
+                    client.requests.put(("login", {"username": "Alice"}))
+                    self.event(client, "response")
+                    client.requests.put(("open_private", {"target_user_id": bob.user["id"]}))
+                    if broken != "open_private":
+                        key = self.event(client, "response")["data"]["room"]["room_key"]
+                        payload = {"room_key": key, "content": "Hello"} if broken == "send_message" else initial_sync(key)
+                        client.requests.put((broken, payload))
+                    self.assertTrue(self.event(client, "error"))
+                    self.event(client, "disconnected")
+                    self.stop_client(client)

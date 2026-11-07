@@ -2,7 +2,7 @@
 
 A Computer Network term project using Python, Tkinter, and TCP sockets. The planned application includes private chats, group chats, and four additional features.
 
-**Current status:** The server and Tkinter client support username-only entry, persistent user IDs, a live online directory, connection management, and ping. All 72 tests passed, including SQLite persistence, real TCP loopback, and Tkinter UI tests. Rooms, chat, groups, and Docker images are not implemented yet.
+**Current status:** The server and Tkinter client support username-only entry, persistent user IDs, a live online directory, private chat with persistent history, connection management, and ping. All 94 tests passed, including SQLite persistence, real TCP loopback, and Tkinter UI tests. Group chat, reactions, pins, AI, sound playback, and Docker images are not implemented yet.
 
 ## Run the server
 
@@ -33,6 +33,16 @@ The online list includes your own name, marked `(you)`, and shows each user once
 Logging out or closing the last connection removes that user from later snapshots. Disconnected sessions are removed by the server worker before requests and during idle maintenance; stored users remain in SQLite. Background polling keeps healthy idle clients active. If a connection fails, the client reports the error and clears the online list. Reconnect explicitly with **Join**. Requests are never retried automatically.
 
 See the local [Client guide](docs/client.md) for details. The `docs/`, `diagram/`, and `GLOSSARY.md` paths are ignored by Git and exist only in the development workspace; they are not included in a Git checkout.
+
+## Private chat
+
+Select another online user and choose **Open Chat**. Type a message and choose **Send**, or press **Ctrl-Enter**. Enter inserts a newline. Both participants open the same private room; the server checks membership for every read and send. A third user cannot access that room by supplying its key.
+
+Opening a room loads its latest 20 messages. **Load older (20)** fetches the next older batch. The active room polls every second, with one request in flight across directory, history, and user actions. Messages use global increasing IDs, so room histories may contain gaps. Catch-up batches are limited to 100 messages and continue from the last delivered ID.
+
+Only the active room is cached in client memory. Switching rooms clears that cache, fetches history again, and ignores replies belonging to an earlier room generation. Send acknowledgements do not append messages or advance the history cursor; the next sync supplies the complete ordered update. A send error retains the input for correction. Private messages remain stored when the other participant is offline, and rooms, memberships, and messages survive a server restart using the same database.
+
+This milestone sends human messages only. Heart/pin/AI/sound fields remain empty; revision-based snapshot reload is reserved for those later features. An unexpected room revision asks the user to reopen the chat rather than claiming that reload is implemented.
 
 ## Username identity
 
@@ -84,13 +94,14 @@ socket-chat/
 |-- .gitignore
 |-- README.md
 |-- server.py                # TCP server and single application worker
-|-- database.py              # Worker-owned SQLite user storage
+|-- database.py              # Worker-owned SQLite users, rooms and messages
 |-- client.py                # Tkinter UI and main-thread event handling
 |-- client_network.py        # Socket worker and request/result queues
 |-- common/
 |   |-- __init__.py
 |   `-- protocol.py          # Shared wire-format helpers
 `-- tests/                   # Protocol, TCP, and Tkinter interaction tests
+    |-- test_chat.py
     |-- test_client_network.py
     |-- test_client_ui.py
     |-- test_directory.py
@@ -99,7 +110,7 @@ socket-chat/
     `-- test_server.py
 ```
 
-The server and client are separate files as required by the assignment. The current server implements ping, username-only login, logout, get_directory, and transport error responses. The directory currently returns `groups: []` because group creation is not implemented yet. Known application actions without handlers return `ACTION_NOT_IMPLEMENTED`; this is not a complete implementation of Protocol v1.1.
+The server and client are separate files as required by the assignment. The current server implements ping, username-only login, logout, get_directory, open_private, send_message, sync_room, and transport error responses. The directory currently returns `groups: []` because group creation is not implemented yet. Known application actions without handlers return `ACTION_NOT_IMPLEMENTED`; this is not a complete implementation of Protocol v1.1.
 
 Local documentation distinguishes **confirmed**, **proposed**, and **unresolved** decisions. Confirming a design does not prove that it has been implemented or tested.
 

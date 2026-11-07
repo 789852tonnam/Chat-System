@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import unicodedata
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
@@ -189,6 +190,62 @@ def validate_username(username: Any) -> str:
     return username
 
 
+# Validate action-specific IDs without accepting bool, float, or numeric strings.
+# Zero is reserved for empty-history cursors and revision counters.
+def validate_id(value: Any, field: str, *, zero: bool = False) -> int:
+    if type(value) is not int or not (0 if zero else 1) <= value <= MAX_REQUEST_ID:
+        raise ProtocolError("INVALID_PAYLOAD", f"{field} must be an integer in the allowed ID range")
+    return value
+
+
+# Enforce canonical room keys before database lookup; access still needs membership.
+# UUID group keys remain recognized even while group actions are unimplemented.
+def validate_room_key(value: Any) -> str:
+    if type(value) is str:
+        match = re.fullmatch(r"private:([1-9][0-9]*):([1-9][0-9]*)", value)
+        if match and len(value) <= 50 and 1 <= int(match[1]) < int(match[2]) <= MAX_REQUEST_ID:
+            return value
+        if re.fullmatch(r"group:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", value):
+            return value
+    raise ProtocolError("INVALID_PAYLOAD", "Invalid room_key")
+
+
+# Preserve user whitespace while normalizing CRLF and rejecting blank/control text.
+# Surrogates are invalid Unicode scalars even when escaped JSON can represent them.
+def validate_content(value: Any) -> str:
+    if type(value) is not str:
+        raise ProtocolError("INVALID_PAYLOAD", "content must be a string")
+    content = value.replace("\r\n", "\n")
+    if (not 1 <= len(content) <= 4000 or not content.strip()
+            or any(unicodedata.category(char) in {"Cc", "Cs"} and char not in "\n\t" for char in content)):
+        raise ProtocolError("INVALID_PAYLOAD", "content must contain 1-4000 characters without unsupported controls")
+    return content
+
+
+# Validate the three supported sync states: initial, empty room, or loaded range.
+# Check each bound independently before relationships so malformed cursors cannot
+# silently become a different query or make bool act as a numeric ID.
+def validate_sync_request(payload: dict[str, Any]) -> None:
+    if set(payload) != {"room_key", "old_count", "oldest_id", "latest_id", "room_revision"}:
+        raise ProtocolError("INVALID_PAYLOAD", "sync_room requires room_key, old_count, oldest_id, latest_id, room_revision")
+    validate_room_key(payload["room_key"])
+    count = payload["old_count"]
+    if type(count) is not int or not 0 <= count <= 100:
+        raise ProtocolError("INVALID_PAYLOAD", "old_count must be an integer between 0 and 100")
+    oldest, latest, revision = payload["oldest_id"], payload["latest_id"], payload["room_revision"]
+    if oldest is not None:
+        validate_id(oldest, "oldest_id")
+    if latest is not None:
+        validate_id(latest, "latest_id", zero=True)
+    if revision is not None:
+        validate_id(revision, "room_revision", zero=True)
+    initial = oldest is None and latest is None and revision is None and count > 0
+    empty = oldest is None and latest == 0 and revision is not None and count == 0
+    loaded = oldest is not None and latest is not None and revision is not None and oldest <= latest
+    if not (initial or empty or loaded):
+        raise ProtocolError("INVALID_PAYLOAD", "Invalid history cursor combination")
+
+
 # Validate the public user fields returned by login and directory responses.
 # Share this check so both actions reject invalid IDs and display names before
 # the UI receives them; additional user fields may be ignored by older clients.
@@ -218,6 +275,90 @@ def validate_directory(data: dict[str, Any]) -> dict[str, Any]:
         ids.add(user["id"])
         names.add(name)
     return data
+
+
+# Check the private-room shape and ensure its key names exactly its two members.
+# This prevents malformed server data from being used as a UI destination.
+def validate_room(room: Any) -> dict[str, Any]:
+    if (type(room) is not dict or not {"room_key", "kind", "name", "created_by_user_id", "created_at", "members"} <= room.keys()
+            or room.get("kind") != "private" or room.get("name") is not None):
+        raise ProtocolError("INVALID_RESPONSE", "Invalid private room")
+    members = room.get("members")
+    if type(members) is not list or len(members) != 2:
+        raise ProtocolError("INVALID_RESPONSE", "Private room requires exactly two members")
+    ids = [validate_user(user)["id"] for user in members]
+    if ids != sorted(set(ids)) or room.get("room_key") != f"private:{ids[0]}:{ids[1]}":
+        raise ProtocolError("INVALID_RESPONSE", "Private room key does not match its members")
+    if (type(room.get("created_by_user_id")) is not int or room["created_by_user_id"] not in ids
+            or type(room.get("created_at")) is not str):
+        raise ProtocolError("INVALID_RESPONSE", "Invalid room creator or timestamp")
+    return room
+
+
+# Validate the human-message format implemented by the current chat milestone.
+# Hearts, pins and AI are not implemented yet, so their empty values are explicit.
+def validate_message(message: Any, room_key: str) -> dict[str, Any]:
+    if (type(message) is not dict or not {"id", "room_key", "sender_kind", "sender", "content", "created_at",
+                                        "heart_count", "hearted_by_me", "ai"} <= message.keys()
+            or message.get("room_key") != room_key):
+        raise ProtocolError("INVALID_RESPONSE", "Message belongs to an unexpected room")
+    validate_id(message.get("id"), "message.id")
+    validate_user(message.get("sender"))
+    if validate_content(message.get("content")) != message["content"]:
+        raise ProtocolError("INVALID_RESPONSE", "Message content must already use normalized newlines")
+    if (message.get("sender_kind") != "human" or type(message.get("created_at")) is not str
+            or type(message.get("heart_count")) is not int or message["heart_count"] != 0
+            or message.get("hearted_by_me") is not False or message.get("ai") is not None):
+        raise ProtocolError("INVALID_RESPONSE", "Invalid message fields")
+    return message
+
+
+# Check room ownership, ordered patches and returned cursors before UI application.
+# Computing expected bounds from delivered IDs prevents skipping unseen messages.
+def validate_sync_response(data: dict[str, Any], request: dict[str, Any]) -> None:
+    if not {"oldest_id", "latest_id", "pinned_message", "effect"} <= data.keys():
+        raise ProtocolError("INVALID_RESPONSE", "History response is missing required fields")
+    if data.get("room_key") != request["room_key"]:
+        raise ProtocolError("INVALID_RESPONSE", "History belongs to an unexpected room")
+    for key in ("has_more_older", "has_more_new", "reload_required"):
+        if type(data.get(key)) is not bool:
+            raise ProtocolError("INVALID_RESPONSE", f"History {key} must be a boolean")
+    validate_id(data.get("room_revision"), "room_revision", zero=True)
+    validate_id(data.get("effect_revision"), "effect_revision", zero=True)
+    if data["oldest_id"] is not None:
+        validate_id(data["oldest_id"], "oldest_id")
+    validate_id(data["latest_id"], "latest_id", zero=True)
+    if data.get("pinned_message") is not None or data.get("effect") is not None or data["effect_revision"] != 0:
+        raise ProtocolError("INVALID_RESPONSE", "This client build does not support pin or sound state yet")
+    arrays = []
+    for key, limit in (("older_messages", request["old_count"]), ("new_messages", 100)):
+        values = data.get(key)
+        if type(values) is not list or len(values) > limit:
+            raise ProtocolError("INVALID_RESPONSE", "Invalid history batch size")
+        ids = [validate_message(message, request["room_key"])["id"] for message in values]
+        if ids != sorted(set(ids)):
+            raise ProtocolError("INVALID_RESPONSE", "History IDs must be unique and increasing")
+        arrays.append(ids)
+    older, newer = arrays
+    if not data["reload_required"] and data["has_more_new"] and len(newer) != 100:
+        raise ProtocolError("INVALID_RESPONSE", "Catch-up flag requires a full new-message batch")
+    oldest, latest = request["oldest_id"], request["latest_id"]
+    if data["reload_required"]:
+        if older or newer:
+            raise ProtocolError("INVALID_RESPONSE", "Reload response must not include history patches")
+    elif latest is None:
+        if newer:
+            raise ProtocolError("INVALID_RESPONSE", "Initial history must be in older_messages")
+        oldest, latest = (older[0], older[-1]) if older else (None, 0)
+    else:
+        if ((older and (oldest is None or older[-1] >= oldest)) or (newer and newer[0] <= latest)):
+            raise ProtocolError("INVALID_RESPONSE", "History patch is outside its requested bounds")
+        oldest = older[0] if older else oldest
+        if newer:
+            oldest = oldest if oldest is not None else newer[0]
+            latest = newer[-1]
+    if data.get("oldest_id") != oldest or data.get("latest_id") != latest:
+        raise ProtocolError("INVALID_RESPONSE", "History cursors do not match delivered messages")
 
 
 # Validate a parsed response against the client's one outstanding request ID.

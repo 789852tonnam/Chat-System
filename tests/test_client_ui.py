@@ -11,6 +11,7 @@ import client
 from client import ClientWindow
 from common.protocol import error_response
 from server import ChatServer, ServerConfig
+from test_chat import ChatPeer
 
 
 class ClientUITests(unittest.TestCase):
@@ -59,6 +60,19 @@ class ClientUITests(unittest.TestCase):
             window.update()
             time.sleep(0.005)
         self.assertTrue(predicate(), "UI did not reach the expected state")
+
+    def raw_peer(self, server, username):
+        peer = ChatPeer(server.address, username)
+        self.addCleanup(peer.close)
+        return peer
+
+    def open_room(self, window, target_id):
+        key = f"user-{target_id}"
+        self.pump_until(window, lambda: window.online_users.exists(key))
+        window.online_users.selection_set(key)
+        window.open_button.invoke()
+        self.pump_until(window, lambda: window._room is not None and window._latest_id is not None
+                        and window._state == "connected")
 
     def test_invalid_address_does_not_start_a_worker(self):
         window = self.window()
@@ -225,5 +239,119 @@ class ClientUITests(unittest.TestCase):
             self.pump_until(window, heartbeat.is_set)
             window.close()
             self.pump_until(window, lambda: window.network is None)
+        finally:
+            release.set()
+
+    def test_two_windows_exchange_private_messages_without_duplicates(self):
+        # Keep both shortened intervals above the 50 ms UI queue tick so an idle
+        # button state remains observable while directory and room polls alternate.
+        with patch("client.DIRECTORY_POLL_INTERVAL", 0.2), patch("client.ROOM_POLL_INTERVAL", 0.1):
+            server = self.server()
+            alice, bob = self.window(server), self.window(server, "Bob")
+            alice.connect()
+            bob.connect()
+            self.pump_until(alice, lambda: alice.user is not None and bob.user is not None)
+            self.open_room(alice, bob.user["id"])
+            self.open_room(bob, alice.user["id"])
+            self.assertEqual(alice._room["room_key"], bob._room["room_key"])
+            self.pump_until(alice, lambda: not alice.send_button.instate(["disabled"]))
+            alice.message_input.insert("1.0", "Hello Bob")
+            alice.send_button.invoke()
+            self.pump_until(alice, lambda: len(alice._messages) == 1 and len(bob._messages) == 1)
+            self.assertIn("Alice: Hello Bob", alice.chat.get("1.0", "end"))
+            self.assertIn("Alice: Hello Bob", bob.chat.get("1.0", "end"))
+            self.assertEqual(alice.message_input.get("1.0", "end-1c"), "")
+            self.assertEqual(set(alice._messages), set(bob._messages))
+
+    def test_history_loads_older_and_room_switch_discards_other_cache(self):
+        server = self.server()
+        raw_alice, raw_bob, raw_carol = [self.raw_peer(server, name) for name in ["Alice", "Bob", "Carol"]]
+        ab = raw_alice.ok("open_private", {"target_user_id": raw_bob.user["id"]})["room"]["room_key"]
+        ac = raw_alice.ok("open_private", {"target_user_id": raw_carol.user["id"]})["room"]["room_key"]
+        for index in range(35):
+            raw_alice.ok("send_message", {"room_key": ab, "content": f"Bob history {index}"})
+        raw_carol.ok("send_message", {"room_key": ac, "content": "Carol only"})
+        window = self.window(server)
+        window.connect()
+        self.open_room(window, raw_bob.user["id"])
+        self.assertEqual(len(window._messages), 20)
+        window.older_button.invoke()
+        self.pump_until(window, lambda: len(window._messages) == 35 and window._state == "connected")
+        self.assertFalse(window._has_more_older)
+        self.open_room(window, raw_carol.user["id"])
+        self.assertEqual([message["content"] for message in window._messages.values()], ["Carol only"])
+        self.assertNotIn("Bob history", window.chat.get("1.0", "end"))
+        self.open_room(window, raw_bob.user["id"])
+        self.assertEqual(len(window._messages), 20)
+
+    def test_old_room_response_is_discarded_when_switching_during_sync(self):
+        entered, release = threading.Event(), threading.Event()
+
+        class DelayedRoomServer(ChatServer):
+            delayed_room = None
+
+            def _handle_request(self, request, session):
+                if request.action == "sync_room" and request.payload["room_key"] == self.delayed_room:
+                    self.delayed_room = None
+                    entered.set()
+                    release.wait(3)
+                return super()._handle_request(request, session)
+
+        server = self.server(DelayedRoomServer)
+        raw_alice, raw_bob, raw_carol = [self.raw_peer(server, name) for name in ["Alice", "Bob", "Carol"]]
+        ab = raw_alice.ok("open_private", {"target_user_id": raw_bob.user["id"]})["room"]["room_key"]
+        ac = raw_alice.ok("open_private", {"target_user_id": raw_carol.user["id"]})["room"]["room_key"]
+        raw_bob.ok("send_message", {"room_key": ab, "content": "Old Bob room"})
+        raw_carol.ok("send_message", {"room_key": ac, "content": "Current Carol room"})
+        server.delayed_room = ab
+        window = self.window(server)
+        try:
+            window.connect()
+            self.pump_until(window, lambda: len(window.online_users.get_children()) == 3)
+            window.online_users.selection_set(f"user-{raw_bob.user['id']}")
+            window.open_chat()
+            self.pump_until(window, entered.is_set)
+            window.online_users.selection_set(f"user-{raw_carol.user['id']}")
+            window.open_chat()
+            release.set()
+            self.pump_until(window, lambda: window._room is not None and window._room["room_key"] == ac
+                            and len(window._messages) == 1)
+            self.assertIn("Current Carol room", window.chat.get("1.0", "end"))
+            self.assertNotIn("Old Bob room", window.chat.get("1.0", "end"))
+        finally:
+            release.set()
+
+    def test_send_ack_does_not_skip_an_earlier_unseen_message(self):
+        entered, release = threading.Event(), threading.Event()
+
+        class DelayedSyncServer(ChatServer):
+            pause_sync = False
+
+            def _handle_request(self, request, session):
+                if request.action == "sync_room" and self.pause_sync:
+                    self.pause_sync = False
+                    entered.set()
+                    release.wait(3)
+                return super()._handle_request(request, session)
+
+        server = self.server(DelayedSyncServer)
+        bob = self.raw_peer(server, "Bob")
+        window = self.window(server)
+        try:
+            window.connect()
+            self.open_room(window, bob.user["id"])
+            window._next_room_poll = time.monotonic() + 60
+            key = window._room["room_key"]
+            bob.ok("send_message", {"room_key": key, "content": "Earlier unseen message"})
+            server.pause_sync = True
+            window.message_input.insert("1.0", "My own message")
+            window.send()
+            self.pump_until(window, entered.is_set)
+            self.assertEqual(window._latest_id, 0)
+            self.assertEqual(window._messages, {})
+            release.set()
+            self.pump_until(window, lambda: len(window._messages) == 2)
+            self.assertEqual([m["content"] for m in window._messages.values()],
+                             ["Earlier unseen message", "My own message"])
         finally:
             release.set()

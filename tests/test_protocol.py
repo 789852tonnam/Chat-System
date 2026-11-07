@@ -1,6 +1,7 @@
 """Wire-format regression tests without a running server."""
 
 import json
+import copy
 import unittest
 
 from common.protocol import (
@@ -15,6 +16,12 @@ from common.protocol import (
     validate_directory,
     validate_response,
     validate_username,
+    validate_content,
+    validate_id,
+    validate_room,
+    validate_room_key,
+    validate_sync_request,
+    validate_sync_response,
 )
 
 
@@ -157,3 +164,67 @@ class DirectoryValidationTests(unittest.TestCase):
         ]:
             with self.subTest(data=data), self.assertRaises(ProtocolError):
                 validate_directory(data)
+
+
+class ChatValidationTests(unittest.TestCase):
+    def test_content_normalizes_crlf_and_rejects_unsupported_text(self):
+        self.assertEqual(validate_content("  one\r\ntwo\t  "), "  one\ntwo\t  ")
+        self.assertEqual(validate_content("x" * 4000), "x" * 4000)
+        for value in [None, True, "", " \n", "x" * 4001, "a\r", "a\x00", "a\x7f", "a\ud800"]:
+            with self.subTest(value=repr(value)), self.assertRaises(ProtocolError):
+                validate_content(value)
+
+    def test_room_keys_and_id_types(self):
+        self.assertEqual(validate_room_key("private:1:2"), "private:1:2")
+        self.assertEqual(validate_id(0, "cursor", zero=True), 0)
+        for key in [None, "", "private:2:1", "private:1:1", "private:01:2", "private:1:9999999999999999"]:
+            with self.subTest(key=key), self.assertRaises(ProtocolError):
+                validate_room_key(key)
+        for value in [True, 1.0, "1", 0, -1]:
+            with self.subTest(value=value), self.assertRaises(ProtocolError):
+                validate_id(value, "id")
+
+    def test_sync_request_initial_empty_and_loaded_states(self):
+        base = {"room_key": "private:1:2", "old_count": 20, "oldest_id": None,
+                "latest_id": None, "room_revision": None}
+        validate_sync_request(base)
+        validate_sync_request({**base, "old_count": 0, "latest_id": 0, "room_revision": 0})
+        validate_sync_request({**base, "oldest_id": 4, "latest_id": 9, "room_revision": 0})
+        for payload in [
+            {**base, "old_count": 0}, {**base, "old_count": True}, {**base, "old_count": 101},
+            {**base, "latest_id": 0}, {**base, "latest_id": True},
+            {**base, "oldest_id": 9, "latest_id": 4, "room_revision": 0},
+            {**base, "oldest_id": 0, "latest_id": 1, "room_revision": 0},
+            {**base, "oldest_id": 1, "latest_id": 2}, {**base, "unexpected": 1},
+        ]:
+            with self.subTest(payload=payload), self.assertRaises(ProtocolError):
+                validate_sync_request(payload)
+
+    def test_room_and_sync_response_reject_wrong_members_and_cursor_skips(self):
+        room = {"room_key": "private:1:2", "kind": "private", "name": None,
+                "created_by_user_id": 1, "created_at": "2026-11-07T00:00:00.000Z",
+                "members": [{"id": 1, "username": "Alice"}, {"id": 2, "username": "Bob"}]}
+        validate_room(room)
+        for bad in [{**room, "room_key": "private:1:3"}, {**room, "created_by_user_id": True},
+                    {**room, "members": room["members"] * 2}]:
+            with self.assertRaises(ProtocolError):
+                validate_room(bad)
+        request = {"room_key": "private:1:2", "old_count": 0, "oldest_id": None,
+                   "latest_id": 0, "room_revision": 0}
+        message = {"id": 8, "room_key": "private:1:2", "sender_kind": "human",
+                   "sender": room["members"][0], "content": "Hello", "created_at": room["created_at"],
+                   "heart_count": 0, "hearted_by_me": False, "ai": None}
+        data = {"room_key": "private:1:2", "older_messages": [], "new_messages": [message],
+                "oldest_id": 8, "latest_id": 8, "has_more_older": False, "has_more_new": False,
+                "room_revision": 0, "reload_required": False, "pinned_message": None,
+                "effect_revision": 0, "effect": None}
+        validate_sync_response(data, request)
+        for bad in [{**data, "latest_id": 999}, {**data, "latest_id": True}, {**data, "has_more_new": True},
+                    {**data, "room_key": "private:1:3"},
+                    {**data, "new_messages": [message, message]}, {**data, "reload_required": True}]:
+            with self.assertRaises(ProtocolError):
+                validate_sync_response(bad, request)
+        bad = copy.deepcopy(data)
+        bad["new_messages"][0]["content"] = "\ud800"
+        with self.assertRaises(ProtocolError):
+            validate_sync_response(bad, request)
