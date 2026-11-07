@@ -2,7 +2,7 @@
 
 A Computer Network term project using Python, Tkinter, and TCP sockets. The planned application includes private chats, group chats, and four additional features.
 
-**Current status:** The server and Tkinter client support username-only entry, persistent user IDs, a live online directory, private chat with persistent history, connection management, and ping. All 98 tests passed, including SQLite persistence, real TCP loopback, and Tkinter UI tests. Group chat, reactions, pins, AI, sound playback, and Docker images are not implemented yet.
+**Current status:** The server and Tkinter client support username-only entry, persistent user IDs, a live online directory, private chat with persistent history, connection management, and ping. All 105 tests passed, including SQLite persistence, real TCP loopback, and Tkinter UI tests. Group chat, reactions, pins, AI, sound playback, and Docker images are not implemented yet.
 
 ## Run the server
 
@@ -26,7 +26,7 @@ python3 client.py --host 127.0.0.1 --port 5000
 
 Enter a username, select **Join**, then **Send Ping**, and check Activity for the pong response. No registration or password is required. Select **Disconnect** to close the connection, or close the window to exit. Tkinter and a graphical display are required. When connecting from another computer, enter the server computer's LAN IP instead of `127.0.0.1`.
 
-`client.py` owns the UI. `client_network.py` owns the socket and network thread. Requests and results pass through queues: the network module never imports Tkinter, and the UI never performs socket I/O. Both client and server receive data with `recv()` and assemble complete JSON lines with `LineFramer`.
+`client.py` owns widgets, input reading, rendering and scrolling. `client_logic.py` owns validation, connection/login state, room/message data, history cursors, request ordering and polling. UI and logic run on the same main thread: button callbacks pass plain values to logic, and logic emits synchronous display events. `client_network.py` owns the existing socket thread and exchanges requests/results with logic through queues. Logic and network never import Tkinter, and the UI never performs socket I/O. Both client and server receive data with `recv()` and assemble complete JSON lines with `LineFramer`.
 
 The online list includes your own name, marked `(you)`, and shows each user once even when that identity has multiple connections. It refreshes immediately after Join, then every 3 seconds after a snapshot returns. Polls wait for any request already in flight and never accumulate. While refreshing, Ping is temporarily disabled; Disconnect and window close remain available. Selection is preserved for users who remain online.
 
@@ -58,7 +58,7 @@ This is identification by name, not password authentication: anyone entering an 
 python3 -m unittest discover -s tests -v
 ```
 
-GUI tests skip when no display is available. TCP tests require permission to open localhost sockets. Unicode fixtures use escape sequences in source files while still exercising multibyte UTF-8 data at runtime.
+Client logic tests run without a display or TCP sockets. GUI tests skip when no display is available. TCP tests require permission to open localhost sockets. Unicode fixtures use escape sequences in source files while still exercising multibyte UTF-8 data at runtime.
 
 ## Local documentation
 
@@ -96,13 +96,15 @@ socket-chat/
 |-- server.py                # Lifecycle, queue, application worker and handlers
 |-- server_network.py        # TCP listener, connection threads and framing
 |-- database.py              # Worker-owned SQLite users, rooms and messages
-|-- client.py                # Tkinter UI and main-thread event handling
+|-- client.py                # Tkinter widgets, callbacks and rendering
+|-- client_logic.py          # Application state, actions and polling
 |-- client_network.py        # Socket worker and request/result queues
 |-- common/
 |   |-- __init__.py
 |   `-- protocol.py          # Shared wire-format helpers
-`-- tests/                   # Protocol, TCP, and Tkinter interaction tests
+`-- tests/                   # Protocol, headless logic, TCP and Tkinter tests
     |-- test_chat.py
+    |-- test_client_logic.py
     |-- test_client_network.py
     |-- test_client_ui.py
     |-- test_directory.py

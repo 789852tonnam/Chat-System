@@ -30,29 +30,29 @@ class NetworkClient(threading.Thread):
     """Own one connection; process queued requests and publish results in order."""
 
     # Prepare one worker's connection settings, queues, and cancellation Event.
-    # The UI may construct this object, but start() runs all socket I/O on run().
+    # Logic constructs this worker; start() runs socket I/O inside run().
     # Use a new instance for reconnecting; a Thread instance cannot start twice.
     def __init__(self, host: str, port: int, *, connect_timeout: float = 5.0,
                  request_timeout: float = 10.0):
         super().__init__(name="chat-client-network")
         # Server hostname or IP passed to create_connection() inside run().
         self.host = host
-        # Server TCP port; the UI validates its range before constructing us.
+        # Server TCP port, already validated by application logic.
         self.port = port
         # Socket connection timeout; hostname lookup is handled by the OS.
         self.connect_timeout = connect_timeout
         # Send timeout and total response-wait limit used by _exchange().
         self.request_timeout = request_timeout
-        # The UI enqueues (action, payload); None wakes the worker for shutdown.
+        # Logic queues (action, payload); None wakes the worker for shutdown.
         self.requests: queue.Queue[tuple[str, dict[str, Any]] | None] = queue.Queue()
-        # The UI consumes connected, response, error, and disconnected events.
+        # Logic consumes connected, response, error, and disconnected events.
         self.events: queue.Queue[tuple[str, Any]] = queue.Queue()
         # Checked between short recv waits so Disconnect does not freeze the UI.
         self._stopping = threading.Event()
 
-    # Called by the UI to request shutdown without operating on the worker socket.
+    # Request shutdown from logic without operating on the worker socket.
     # The Event cancels an active receive loop; None wakes a blocked queue.get().
-    # This method returns immediately; the UI waits for thread exit with after().
+    # Returns immediately; logic checks for thread exit on each UI tick.
     def stop(self) -> None:
         self._stopping.set()
         self.requests.put(None)

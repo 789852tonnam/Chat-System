@@ -38,11 +38,11 @@ class ClientUITests(unittest.TestCase):
         return window
 
     def close_window(self, window):
-        if window.network is not None:
-            window.network.stop()
-            window.network.join(3)
-            self.assertFalse(window.network.is_alive())
-            window.network = None
+        if window.logic.network is not None:
+            window.logic.network.stop()
+            window.logic.network.join(3)
+            self.assertFalse(window.logic.network.is_alive())
+            window.logic.network = None
         try:
             window.close()
         except tk.TclError:
@@ -71,14 +71,14 @@ class ClientUITests(unittest.TestCase):
         self.pump_until(window, lambda: window.online_users.exists(key))
         window.online_users.selection_set(key)
         window.open_button.invoke()
-        self.pump_until(window, lambda: window._room is not None and window._latest_id is not None
-                        and window._state == "connected")
+        self.pump_until(window, lambda: window.logic.room is not None and window.logic.latest_id is not None
+                        and window.logic.state == "connected")
 
     def test_invalid_address_does_not_start_a_worker(self):
         window = self.window()
         window.port.set("0")
         window.connect_button.invoke()
-        self.assertIsNone(window.network)
+        self.assertIsNone(window.logic.network)
         self.assertIn("between 1 and 65535", window.status.get())
         self.assertEqual(window.host.get(), "127.0.0.1")
         self.assertTrue(window.ping_button.instate(["disabled"]))
@@ -89,28 +89,28 @@ class ClientUITests(unittest.TestCase):
         for _ in range(2):
             window.connect_button.invoke()
             self.assertTrue(window.connect_button.instate(["disabled"]))
-            self.pump_until(window, lambda: window._state == "connected")
+            self.pump_until(window, lambda: window.logic.state == "connected")
             self.assertTrue(window.host_entry.instate(["readonly"]))
             self.assertTrue(window.username_entry.instate(["readonly"]))
             self.assertEqual(window.status.get(), "Joined as Alice")
-            users.append(window.user)
+            users.append(window.logic.user)
             window.ping_button.invoke()
             self.assertTrue(window.ping_button.instate(["disabled"]))
-            self.pump_until(window, lambda: window._state == "connected")
+            self.pump_until(window, lambda: window.logic.state == "connected")
             self.assertIn("{'pong': True}", window.activity.get("1.0", "end"))
-            worker = window.network
+            worker = window.logic.network
             window.disconnect_button.invoke()
-            self.pump_until(window, lambda: window.network is None)
+            self.pump_until(window, lambda: window.logic.network is None)
             self.assertFalse(worker.is_alive())
             self.assertFalse(window.connect_button.instate(["disabled"]))
-            self.assertIsNone(window.user)
+            self.assertIsNone(window.logic.user)
         self.assertEqual(users[0], users[1])
 
     def test_invalid_username_does_not_start_a_worker(self):
         window = self.window()
         window.username.set("invalid name")
         window.connect_button.invoke()
-        self.assertIsNone(window.network)
+        self.assertIsNone(window.logic.network)
         self.assertIn("Username must", window.status.get())
 
     def test_rejected_login_returns_to_the_join_form(self):
@@ -120,8 +120,8 @@ class ClientUITests(unittest.TestCase):
 
         window = self.window(self.server(RejectingServer))
         window.connect()
-        self.pump_until(window, lambda: window.network is None)
-        self.assertIsNone(window.user)
+        self.pump_until(window, lambda: window.logic.network is None)
+        self.assertIsNone(window.logic.user)
         self.assertIn("Name rejected", window.activity.get("1.0", "end"))
         self.assertFalse(window.username_entry.instate(["readonly"]))
 
@@ -139,10 +139,10 @@ class ClientUITests(unittest.TestCase):
         try:
             window.connect()
             self.pump_until(window, entered.is_set)
-            self.assertEqual(window._state, "joining")
-            worker = window.network
+            self.assertEqual(window.logic.state, "joining")
+            worker = window.logic.network
             window.close()
-            self.pump_until(window, lambda: window.network is None)
+            self.pump_until(window, lambda: window.logic.network is None)
             self.assertFalse(worker.is_alive())
         finally:
             release.set()
@@ -161,19 +161,19 @@ class ClientUITests(unittest.TestCase):
         window = self.window(self.server(WaitingServer))
         try:
             window.connect()
-            self.pump_until(window, lambda: window._state == "connected")
+            self.pump_until(window, lambda: window.logic.state == "connected")
             window.ping()
             self.pump_until(window, entered.is_set)
             heartbeat = threading.Event()
             window.after(10, heartbeat.set)
             self.pump_until(window, heartbeat.is_set)
-            self.assertEqual(window._state, "waiting")
-            window._next_directory_poll = time.monotonic() - 1
-            window._poll_directory()
-            self.assertTrue(window.network.requests.empty())
-            worker = window.network
+            self.assertEqual(window.logic.state, "waiting")
+            window.logic._next_directory_poll = time.monotonic() - 1
+            window.logic._poll_directory()
+            self.assertTrue(window.logic.network.requests.empty())
+            worker = window.logic.network
             window.close()
-            self.pump_until(window, lambda: window.network is None)
+            self.pump_until(window, lambda: window.logic.network is None)
             self.assertFalse(worker.is_alive())
         finally:
             release.set()
@@ -181,16 +181,16 @@ class ClientUITests(unittest.TestCase):
     def test_terminal_interrupt_stops_the_network_worker(self):
         window = self.window(self.server())
         window.connect()
-        self.pump_until(window, lambda: window._state == "connected")
-        worker = window.network
+        self.pump_until(window, lambda: window.logic.state == "connected")
+        worker = window.logic.network
         with patch("sys.argv", ["client.py"]), patch("client.ClientWindow", return_value=window), \
                 patch.object(window, "mainloop", side_effect=KeyboardInterrupt):
             client.main()
         self.assertFalse(worker.is_alive())
-        self.assertIsNone(window.network)
+        self.assertIsNone(window.logic.network)
 
     def test_directory_poll_updates_two_windows_and_preserves_selection(self):
-        with patch("client.DIRECTORY_POLL_INTERVAL", 0.05):
+        with patch("client_logic.DIRECTORY_POLL_INTERVAL", 0.05):
             server = self.server()
             alice = self.window(server)
             bob = self.window(server, "Bob")
@@ -202,14 +202,14 @@ class ClientUITests(unittest.TestCase):
             texts = [alice.online_users.item(key, "text") for key in alice.online_users.get_children()]
             self.assertEqual(texts, ["Alice (you)", "Bob"])
             self.assertEqual(alice.directory_status.get(), "Online users (2)")
-            selected = f"user-{bob.user['id']}"
+            selected = f"user-{bob.logic.user['id']}"
             alice.online_users.selection_set(selected)
-            alice._next_directory_poll = time.monotonic() - 1
-            self.pump_until(alice, lambda: alice._state == "refreshing")
-            self.pump_until(alice, lambda: alice._state == "connected")
+            alice.logic._next_directory_poll = time.monotonic() - 1
+            self.pump_until(alice, lambda: alice.logic.state == "refreshing")
+            self.pump_until(alice, lambda: alice.logic.state == "connected")
             self.assertEqual(alice.online_users.selection(), (selected,))
             bob.disconnect()
-            self.pump_until(alice, lambda: bob.network is None and len(alice.online_users.get_children()) == 1)
+            self.pump_until(alice, lambda: bob.logic.network is None and len(alice.online_users.get_children()) == 1)
             self.assertEqual(bob.online_users.get_children(), ())
             self.assertEqual(alice.online_users.item(alice.online_users.get_children()[0], "text"), "Alice (you)")
 
@@ -228,40 +228,40 @@ class ClientUITests(unittest.TestCase):
         try:
             window.connect()
             self.pump_until(window, entered.is_set)
-            self.assertEqual(window._state, "refreshing")
+            self.assertEqual(window.logic.state, "refreshing")
             self.assertTrue(window.ping_button.instate(["disabled"]))
-            window._next_directory_poll = time.monotonic() - 1
+            window.logic._next_directory_poll = time.monotonic() - 1
             for _ in range(3):
-                window._poll_directory()
-            self.assertTrue(window.network.requests.empty())
+                window.logic._poll_directory()
+            self.assertTrue(window.logic.network.requests.empty())
             heartbeat = threading.Event()
             window.after(10, heartbeat.set)
             self.pump_until(window, heartbeat.is_set)
             window.close()
-            self.pump_until(window, lambda: window.network is None)
+            self.pump_until(window, lambda: window.logic.network is None)
         finally:
             release.set()
 
     def test_two_windows_exchange_private_messages_without_duplicates(self):
         # Keep both shortened intervals above the 50 ms UI queue tick so an idle
         # button state remains observable while directory and room polls alternate.
-        with patch("client.DIRECTORY_POLL_INTERVAL", 0.2), patch("client.ROOM_POLL_INTERVAL", 0.1):
+        with patch("client_logic.DIRECTORY_POLL_INTERVAL", 0.2), patch("client_logic.ROOM_POLL_INTERVAL", 0.1):
             server = self.server()
             alice, bob = self.window(server), self.window(server, "Bob")
             alice.connect()
             bob.connect()
-            self.pump_until(alice, lambda: alice.user is not None and bob.user is not None)
-            self.open_room(alice, bob.user["id"])
-            self.open_room(bob, alice.user["id"])
-            self.assertEqual(alice._room["room_key"], bob._room["room_key"])
+            self.pump_until(alice, lambda: alice.logic.user is not None and bob.logic.user is not None)
+            self.open_room(alice, bob.logic.user["id"])
+            self.open_room(bob, alice.logic.user["id"])
+            self.assertEqual(alice.logic.room["room_key"], bob.logic.room["room_key"])
             self.pump_until(alice, lambda: not alice.send_button.instate(["disabled"]))
             alice.message_input.insert("1.0", "Hello Bob")
             alice.send_button.invoke()
-            self.pump_until(alice, lambda: len(alice._messages) == 1 and len(bob._messages) == 1)
+            self.pump_until(alice, lambda: len(alice.logic.messages) == 1 and len(bob.logic.messages) == 1)
             self.assertIn("Alice: Hello Bob", alice.chat.get("1.0", "end"))
             self.assertIn("Alice: Hello Bob", bob.chat.get("1.0", "end"))
             self.assertEqual(alice.message_input.get("1.0", "end-1c"), "")
-            self.assertEqual(set(alice._messages), set(bob._messages))
+            self.assertEqual(set(alice.logic.messages), set(bob.logic.messages))
 
     def test_history_loads_older_and_room_switch_discards_other_cache(self):
         server = self.server()
@@ -274,15 +274,15 @@ class ClientUITests(unittest.TestCase):
         window = self.window(server)
         window.connect()
         self.open_room(window, raw_bob.user["id"])
-        self.assertEqual(len(window._messages), 20)
+        self.assertEqual(len(window.logic.messages), 20)
         window.older_button.invoke()
-        self.pump_until(window, lambda: len(window._messages) == 35 and window._state == "connected")
-        self.assertFalse(window._has_more_older)
+        self.pump_until(window, lambda: len(window.logic.messages) == 35 and window.logic.state == "connected")
+        self.assertFalse(window.logic.has_more_older)
         self.open_room(window, raw_carol.user["id"])
-        self.assertEqual([message["content"] for message in window._messages.values()], ["Carol only"])
+        self.assertEqual([message["content"] for message in window.logic.messages.values()], ["Carol only"])
         self.assertNotIn("Bob history", window.chat.get("1.0", "end"))
         self.open_room(window, raw_bob.user["id"])
-        self.assertEqual(len(window._messages), 20)
+        self.assertEqual(len(window.logic.messages), 20)
 
     def test_old_room_response_is_discarded_when_switching_during_sync(self):
         entered, release = threading.Event(), threading.Event()
@@ -314,8 +314,8 @@ class ClientUITests(unittest.TestCase):
             window.online_users.selection_set(f"user-{raw_carol.user['id']}")
             window.open_chat()
             release.set()
-            self.pump_until(window, lambda: window._room is not None and window._room["room_key"] == ac
-                            and len(window._messages) == 1)
+            self.pump_until(window, lambda: window.logic.room is not None and window.logic.room["room_key"] == ac
+                            and len(window.logic.messages) == 1)
             self.assertIn("Current Carol room", window.chat.get("1.0", "end"))
             self.assertNotIn("Old Bob room", window.chat.get("1.0", "end"))
         finally:
@@ -340,18 +340,18 @@ class ClientUITests(unittest.TestCase):
         try:
             window.connect()
             self.open_room(window, bob.user["id"])
-            window._next_room_poll = time.monotonic() + 60
-            key = window._room["room_key"]
+            window.logic._next_room_poll = time.monotonic() + 60
+            key = window.logic.room["room_key"]
             bob.ok("send_message", {"room_key": key, "content": "Earlier unseen message"})
             server.pause_sync = True
             window.message_input.insert("1.0", "My own message")
             window.send()
             self.pump_until(window, entered.is_set)
-            self.assertEqual(window._latest_id, 0)
-            self.assertEqual(window._messages, {})
+            self.assertEqual(window.logic.latest_id, 0)
+            self.assertEqual(window.logic.messages, {})
             release.set()
-            self.pump_until(window, lambda: len(window._messages) == 2)
-            self.assertEqual([m["content"] for m in window._messages.values()],
+            self.pump_until(window, lambda: len(window.logic.messages) == 2)
+            self.assertEqual([m["content"] for m in window.logic.messages.values()],
                              ["Earlier unseen message", "My own message"])
         finally:
             release.set()
