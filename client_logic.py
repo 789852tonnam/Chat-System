@@ -8,7 +8,7 @@ from collections.abc import Callable
 from typing import Any
 
 from client_network import NetworkClient
-from common.protocol import ProtocolError, validate_content, validate_username
+from common.protocol import ProtocolError, validate_content, validate_group_name, validate_username
 
 
 # Start the next directory poll after the previous response, without stacking.
@@ -22,7 +22,8 @@ class ClientLogic:
 
     The owner calls actions and poll(), reads state, and handles synchronous
     events: state, log, input_error, directory, room_cleared, room_title,
-    messages (new older messages, previous-history flag), sent and closed.
+    messages (new older messages, previous-history flag), sent, group_created
+    and closed. A directory event carries the full online-user/group snapshot.
     Only NetworkClient performs socket I/O on its existing worker thread.
     """
 
@@ -42,6 +43,8 @@ class ClientLogic:
         self._username = ""
         # Validated server identity, present only after successful login.
         self.user: dict | None = None
+        # Public group metadata/members from directory; no other room histories.
+        self.groups: dict[str, dict] = {}
         # Next directory deadline; None while a directory request is pending.
         self._next_directory_poll: float | None = None
         # Exactly one application request is outstanding on the connection.
@@ -50,8 +53,8 @@ class ClientLogic:
         self._pending_generation = 0
         # Incremented on room clear/switch to reject replies for earlier rooms.
         self._room_generation = 0
-        # Latest requested target takes priority after in-flight work finishes.
-        self._queued_target: int | None = None
+        # Latest private/group opening takes priority after in-flight work finishes.
+        self._queued_room: tuple[str, dict] | None = None
         # Metadata for the single active conversation; other rooms are not cached.
         self.room: dict | None = None
         # Deduplicate history patches by global message ID within the active room.
@@ -120,8 +123,35 @@ class ClientLogic:
             self._emit("log", "Choose another user for a private chat.")
             return
         self._clear_room()
-        self._queued_target = target
+        self._queued_room = ("open_private", {"target_user_id": target})
         self._emit("room_title", f"Opening chat with {name}...")
+        self._set_state(self.state)
+        self._schedule_requests()
+
+    # Validate a group name and create it as the only initial member.
+    # Open the new room after acknowledgement, unless the user switches meanwhile.
+    def create_group(self, name: str) -> None:
+        if self.user is None or self.state != "connected":
+            return
+        try:
+            name = validate_group_name(name)
+        except ProtocolError as exc:
+            self._emit("log", exc.message)
+            return
+        self._clear_room()
+        self._request("create_group", {"name": name}, "creating")
+
+    # Join or reopen a directory group using the same idempotent server action.
+    # Only this user joins; selecting a group alone never reads its messages.
+    def open_group(self, room_key: str) -> None:
+        if self.user is None or self.state in {"disconnecting", "closing"}:
+            return
+        group = self.groups.get(room_key)
+        if group is None:
+            return
+        self._clear_room()
+        self._queued_room = ("join_group", {"room_key": room_key})
+        self._emit("room_title", f"Opening group {group['name']}...")
         self._set_state(self.state)
         self._schedule_requests()
 
@@ -153,7 +183,7 @@ class ClientLogic:
     # Incrementing generation makes already-pending replies harmless to the new room.
     def _clear_room(self) -> None:
         self._room_generation += 1
-        self._queued_target = None
+        self._queued_room = None
         self.room = None
         self.messages.clear()
         self.oldest_id = self.latest_id = self.room_revision = None
@@ -212,7 +242,12 @@ class ClientLogic:
         self._pending_action = None
         if self.state in {"disconnecting", "closing"}:
             return
-        if action in {"open_private", "send_message", "sync_room"} and generation != self._room_generation:
+        # Mutations still refresh discovery even when their room was superseded.
+        if action in {"create_group", "join_group"} and response["ok"]:
+            self._next_directory_poll = time.monotonic()
+            if action == "create_group":
+                self._emit("group_created", None)
+        if action in {"open_private", "create_group", "join_group", "send_message", "sync_room"} and generation != self._room_generation:
             self._set_state("connected")
             return
         if not response["ok"]:
@@ -222,7 +257,7 @@ class ClientLogic:
                 return
             if action == "get_directory":
                 self._next_directory_poll = time.monotonic() + DIRECTORY_POLL_INTERVAL
-            if action == "open_private" or response["error"]["code"] in {"ROOM_NOT_FOUND", "NOT_ROOM_MEMBER"}:
+            if action in {"open_private", "create_group", "join_group"} or response["error"]["code"] in {"ROOM_NOT_FOUND", "NOT_ROOM_MEMBER"}:
                 self._clear_room()
             elif action == "sync_room":
                 self._next_room_poll = time.monotonic() + ROOM_POLL_INTERVAL
@@ -233,12 +268,18 @@ class ClientLogic:
                 self._emit("log", f"Joined as {self.user['username']} (user #{self.user['id']}).")
                 self._next_directory_poll = time.monotonic()
             elif action == "get_directory":
-                self._emit("directory", data["online_users"])
+                self.groups = {group["room_key"]: group for group in data["groups"]}
+                if self.room is not None and self.room["kind"] == "group":
+                    self.room = self.groups.get(self.room["room_key"], self.room)
+                self._emit("directory", data)
                 self._next_directory_poll = time.monotonic() + DIRECTORY_POLL_INTERVAL
-            elif action == "open_private":
+            elif action in {"open_private", "create_group", "join_group"}:
                 self.room = data["room"]
-                partner = next(member for member in self.room["members"] if member["id"] != self.user["id"])
-                self._emit("room_title", f"Chat with {partner['username']}")
+                if self.room["kind"] == "group":
+                    self._emit("room_title", f"Group: {self.room['name']}")
+                else:
+                    partner = next(member for member in self.room["members"] if member["id"] != self.user["id"])
+                    self._emit("room_title", f"Chat with {partner['username']}")
                 self._next_room_poll = time.monotonic()
             elif action == "send_message":
                 self._emit("sent", None)
@@ -254,10 +295,10 @@ class ClientLogic:
     def _schedule_requests(self) -> None:
         if self.network is None or self.state != "connected":
             return
-        if self._queued_target is not None:
-            target = self._queued_target
-            self._queued_target = None
-            self._request("open_private", {"target_user_id": target}, "opening")
+        if self._queued_room is not None:
+            action, payload = self._queued_room
+            self._queued_room = None
+            self._request(action, payload, "opening")
         else:
             self._poll_directory()
             if (self.state == "connected" and self.room is not None and self._next_room_poll is not None
@@ -287,10 +328,11 @@ class ClientLogic:
                 self.network.join()
                 self.network = None
                 self.user = None
+                self.groups.clear()
                 self._pending_action = None
                 self._clear_room()
                 self._next_directory_poll = None
-                self._emit("directory", [])
+                self._emit("directory", {"online_users": [], "groups": []})
                 if self.closing:
                     self._emit("closed", None)
                     return
@@ -301,7 +343,7 @@ class ClientLogic:
     # Poll after each completed directory response; missed polls never accumulate.
     # An existing user request takes precedence over this background refresh.
     def _poll_directory(self) -> None:
-        if (self.network is not None and self.state == "connected" and self._queued_target is None
+        if (self.network is not None and self.state == "connected" and self._queued_room is None
                 and self._next_directory_poll is not None
                 and time.monotonic() >= self._next_directory_poll):
             self._next_directory_poll = None

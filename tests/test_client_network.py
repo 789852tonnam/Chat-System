@@ -85,6 +85,59 @@ class ClientNetworkTests(unittest.TestCase):
         self.assertIn("invalid user", self.event(client, "error"))
         self.event(client, "disconnected")
 
+    def test_group_creation_discovery_join_and_messages_pass_response_validation(self):
+        server = self.server()
+        with ChatPeer(server.address, "Bob") as bob:
+            client = self.client(server)
+            client.requests.put(("login", {"username": "Alice"}))
+            alice = self.event(client, "response")["data"]["user"]
+            client.requests.put(("create_group", {"name": "  Study  "}))
+            group = self.event(client, "response")["data"]["room"]
+            self.assertEqual(group["members"], [alice])
+            self.assertEqual(group["name"], "Study")
+            client.requests.put(("get_directory", {}))
+            self.assertEqual(self.event(client, "response")["data"]["groups"], [group])
+            key = group["room_key"]
+            bob.ok("join_group", {"room_key": key})
+            client.requests.put(("join_group", {"room_key": key}))
+            self.assertFalse(self.event(client, "response")["data"]["joined"])
+            bob.ok("send_message", {"room_key": key, "content": "Group message"})
+            client.requests.put(("sync_room", initial_sync(key)))
+            self.assertEqual(self.event(client, "response")["data"]["older_messages"][0]["sender"], bob.user)
+
+    def test_invalid_group_action_responses_close_connection(self):
+        for broken in ("members", "name", "key", "joined", "membership"):
+            with self.subTest(broken=broken):
+                action = "create_group" if broken in {"members", "name"} else "join_group"
+
+                class InvalidGroupServer(ChatServer):
+                    def _handle_request(self, request, session):
+                        response = super()._handle_request(request, session)
+                        if request.action == action and response["ok"]:
+                            room = response["data"]["room"]
+                            if broken == "members":
+                                room["members"] = sorted(room["members"] + [bob.user], key=lambda user: user["id"])
+                            elif broken == "name":
+                                room["name"] = "Unexpected"
+                            elif broken == "key":
+                                room["room_key"] = "group:00000000-0000-4000-8000-000000000000"
+                            elif broken == "joined":
+                                response["data"]["joined"] = 1
+                            else:
+                                room["members"] = [bob.user]
+                        return response
+
+                server = self.server(InvalidGroupServer)
+                with ChatPeer(server.address, "Bob") as bob:
+                    key = bob.ok("create_group", {"name": "Study"})["room"]["room_key"] if action == "join_group" else None
+                    client = self.client(server)
+                    client.requests.put(("login", {"username": "Alice"}))
+                    self.event(client, "response")
+                    client.requests.put((action, {"name": "Study"} if action == "create_group" else {"room_key": key}))
+                    self.assertTrue(self.event(client, "error"))
+                    self.event(client, "disconnected")
+                    self.stop_client(client)
+
     def test_invalid_login_user_response_closes_connection(self):
         for user in [None, {"id": True, "username": "Alice"},
                      {"id": 1, "username": "invalid name"}]:

@@ -190,6 +190,15 @@ def validate_username(username: Any) -> str:
     return username
 
 
+# Trim group names while rejecting blank, oversized, control or multiline input.
+# The same rule is used for local forms, server requests and room responses.
+def validate_group_name(name: Any) -> str:
+    if (type(name) is not str or not 1 <= len(name.strip()) <= 80
+            or any(unicodedata.category(char) in {"Cc", "Cs", "Zl", "Zp"} for char in name)):
+        raise ProtocolError("INVALID_PAYLOAD", "Group name must contain 1-80 characters without controls or line breaks")
+    return name.strip()
+
+
 # Validate action-specific IDs without accepting bool, float, or numeric strings.
 # Zero is reserved for empty-history cursors and revision counters.
 def validate_id(value: Any, field: str, *, zero: bool = False) -> int:
@@ -199,7 +208,7 @@ def validate_id(value: Any, field: str, *, zero: bool = False) -> int:
 
 
 # Enforce canonical room keys before database lookup; access still needs membership.
-# UUID group keys remain recognized even while group actions are unimplemented.
+# Group keys use lowercase UUID v4; private keys use sorted account IDs.
 def validate_room_key(value: Any) -> str:
     if type(value) is str:
         match = re.fullmatch(r"private:([1-9][0-9]*):([1-9][0-9]*)", value)
@@ -259,9 +268,9 @@ def validate_user(user: Any) -> dict[str, Any]:
     return user
 
 
-# Check the online list before passing a directory snapshot to Tkinter.
+# Check the full public directory before application logic receives a snapshot.
 # Names and IDs must be unique; multiple connections are represented once.
-# Groups are only checked as a list until group handling is implemented.
+# Public group documents include members but never private-room history.
 def validate_directory(data: dict[str, Any]) -> dict[str, Any]:
     if type(data.get("online_users")) is not list or type(data.get("groups")) is not list:
         raise ProtocolError("INVALID_RESPONSE", "Directory must contain online_users and groups lists")
@@ -274,21 +283,37 @@ def validate_directory(data: dict[str, Any]) -> dict[str, Any]:
             raise ProtocolError("INVALID_RESPONSE", "Directory contains duplicate users")
         ids.add(user["id"])
         names.add(name)
+    group_keys = set()
+    for group in data["groups"]:
+        validate_room(group)
+        if group["kind"] != "group" or group["room_key"] in group_keys:
+            raise ProtocolError("INVALID_RESPONSE", "Directory contains invalid or duplicate groups")
+        group_keys.add(group["room_key"])
     return data
 
 
-# Check the private-room shape and ensure its key names exactly its two members.
-# This prevents malformed server data from being used as a UI destination.
+# Check common room fields, sorted unique members and the creator's membership.
+# Private keys must name exactly two members; groups require a canonical key/name.
 def validate_room(room: Any) -> dict[str, Any]:
     if (type(room) is not dict or not {"room_key", "kind", "name", "created_by_user_id", "created_at", "members"} <= room.keys()
-            or room.get("kind") != "private" or room.get("name") is not None):
-        raise ProtocolError("INVALID_RESPONSE", "Invalid private room")
+            or room.get("kind") not in ("private", "group")):
+        raise ProtocolError("INVALID_RESPONSE", "Invalid room")
     members = room.get("members")
-    if type(members) is not list or len(members) != 2:
-        raise ProtocolError("INVALID_RESPONSE", "Private room requires exactly two members")
+    if type(members) is not list or not members:
+        raise ProtocolError("INVALID_RESPONSE", "Room requires members")
     ids = [validate_user(user)["id"] for user in members]
-    if ids != sorted(set(ids)) or room.get("room_key") != f"private:{ids[0]}:{ids[1]}":
-        raise ProtocolError("INVALID_RESPONSE", "Private room key does not match its members")
+    if ids != sorted(set(ids)):
+        raise ProtocolError("INVALID_RESPONSE", "Room members must be sorted and unique")
+    if room["kind"] == "private":
+        if len(ids) != 2 or room["name"] is not None or room["room_key"] != f"private:{ids[0]}:{ids[1]}":
+            raise ProtocolError("INVALID_RESPONSE", "Private room key does not match its members")
+    else:
+        try:
+            validate_room_key(room["room_key"])
+            if not room["room_key"].startswith("group:") or validate_group_name(room["name"]) != room["name"]:
+                raise ProtocolError("INVALID_RESPONSE", "Invalid group key or name")
+        except ProtocolError:
+            raise ProtocolError("INVALID_RESPONSE", "Invalid group key or name") from None
     if (type(room.get("created_by_user_id")) is not int or room["created_by_user_id"] not in ids
             or type(room.get("created_at")) is not str):
         raise ProtocolError("INVALID_RESPONSE", "Invalid room creator or timestamp")

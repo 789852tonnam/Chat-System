@@ -17,6 +17,7 @@ from common.protocol import (
     validate_response,
     validate_username,
     validate_content,
+    validate_group_name,
     validate_id,
     validate_room,
     validate_room_key,
@@ -167,6 +168,39 @@ class DirectoryValidationTests(unittest.TestCase):
 
 
 class ChatValidationTests(unittest.TestCase):
+    def test_group_names_trim_unicode_and_reject_controls_or_line_breaks(self):
+        self.assertEqual(validate_group_name("  Study  "), "Study")
+        self.assertEqual(validate_group_name("\u0e01" * 80), "\u0e01" * 80)
+        for value in [None, True, 1, "", "  ", "a" * 81, "bad\n", "bad\rname",
+                      "bad\tname", "bad\x7f", "bad\ud800", "bad\u2028name", "bad\u2029name"]:
+            with self.subTest(value=repr(value)), self.assertRaises(ProtocolError):
+                validate_group_name(value)
+
+    def test_group_room_requires_canonical_key_name_and_unique_members(self):
+        group = {"room_key": "group:00000000-0000-4000-8000-000000000000", "kind": "group",
+                 "name": "Study", "created_by_user_id": 1, "created_at": "2026-11-08T00:00:00.000Z",
+                 "members": [{"id": 1, "username": "Alice"}]}
+        self.assertIs(validate_room(group), group)
+        for bad in [
+            {**group, "room_key": "private:1:2"}, {**group, "room_key": group["room_key"].replace("4000", "1000")},
+            {**group, "name": " Study "}, {**group, "name": None}, {**group, "name": "line\nbreak"},
+            {**group, "members": []}, {**group, "members": group["members"] * 2},
+            {**group, "created_by_user_id": 2}, {**group, "kind": []},
+        ]:
+            with self.subTest(bad=bad), self.assertRaises(ProtocolError):
+                validate_room(bad)
+
+    def test_directory_rejects_duplicate_groups_and_private_rooms(self):
+        group = {"room_key": "group:00000000-0000-4000-8000-000000000000", "kind": "group",
+                 "name": "Study", "created_by_user_id": 1, "created_at": "2026-11-08T00:00:00.000Z",
+                 "members": [{"id": 1, "username": "Alice"}]}
+        private = {**group, "room_key": "private:1:2", "kind": "private", "name": None,
+                   "members": group["members"] + [{"id": 2, "username": "Bob"}]}
+        validate_directory({"online_users": [], "groups": [group]})
+        for groups in [[group, group], [private], [None], [{**group, "name": ""}]]:
+            with self.subTest(groups=groups), self.assertRaises(ProtocolError):
+                validate_directory({"online_users": [], "groups": groups})
+
     def test_content_normalizes_crlf_and_rejects_unsupported_text(self):
         self.assertEqual(validate_content("  one\r\ntwo\t  "), "  one\ntwo\t  ")
         self.assertEqual(validate_content("x" * 4000), "x" * 4000)

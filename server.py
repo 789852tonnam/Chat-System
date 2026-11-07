@@ -18,13 +18,17 @@ from common.protocol import (
     error_response,
     success_response,
     validate_content,
+    validate_group_name,
     validate_id,
     validate_room_key,
     validate_sync_request,
     validate_username,
 )
 from server_network import ClientSession, ServerNetwork
-from database import get_or_create_user, open_database, open_private, send_message, sync_room
+from database import (
+    create_group, get_or_create_user, join_group, list_groups,
+    open_database, open_private, send_message, sync_room,
+)
 
 LOGGER = logging.getLogger("socket_chat.server")
 _STOP = object()
@@ -236,7 +240,8 @@ class ChatServer:
         """Only the central worker calls application handlers."""
         if request.action not in KNOWN_ACTIONS:
             return error_response(request.request_id, "UNKNOWN_ACTION", "Unknown action")
-        if request.action not in {"ping", "login", "logout", "get_directory", "open_private", "send_message", "sync_room"}:
+        if request.action not in {"ping", "login", "logout", "get_directory", "open_private",
+                                  "create_group", "join_group", "send_message", "sync_room"}:
             return error_response(
                 request.request_id,
                 "ACTION_NOT_IMPLEMENTED",
@@ -263,13 +268,22 @@ class ChatServer:
         if request.action == "get_directory":
             users = {active.user["id"]: active.user for active in self._sessions}
             online_users = sorted(users.values(), key=lambda user: (user["username"].lower(), user["id"]))
-            # No groups exist yet; create_group remains explicitly unimplemented.
-            return success_response(request.request_id, {"online_users": online_users, "groups": []})
+            return success_response(request.request_id, {"online_users": online_users, "groups": list_groups(self._database)})
         if request.action == "open_private":
             if set(request.payload) != {"target_user_id"}:
                 raise ProtocolError("INVALID_PAYLOAD", "open_private requires only target_user_id")
             target = validate_id(request.payload["target_user_id"], "target_user_id")
             return success_response(request.request_id, open_private(self._database, session.user["id"], target))
+        if request.action == "create_group":
+            if set(request.payload) != {"name"}:
+                raise ProtocolError("INVALID_PAYLOAD", "create_group requires only name")
+            name = validate_group_name(request.payload["name"])
+            return success_response(request.request_id, create_group(self._database, session.user["id"], name))
+        if request.action == "join_group":
+            if set(request.payload) != {"room_key"}:
+                raise ProtocolError("INVALID_PAYLOAD", "join_group requires only room_key")
+            room_key = validate_room_key(request.payload["room_key"])
+            return success_response(request.request_id, join_group(self._database, session.user["id"], room_key))
         if request.action == "send_message":
             if set(request.payload) != {"room_key", "content"}:
                 raise ProtocolError("INVALID_PAYLOAD", "send_message requires room_key and content")

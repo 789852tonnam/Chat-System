@@ -1,6 +1,7 @@
-"""SQLite users, private rooms and messages, owned by the application worker."""
+"""SQLite users, rooms, memberships and messages, owned by the application worker."""
 
 import sqlite3
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -81,7 +82,7 @@ def _timestamp() -> str:
 
 
 # Check room existence before membership so all room actions share error order.
-# Knowing a private room key never grants read or write access.
+# Knowing any room key never grants read or write access.
 def require_room(connection: sqlite3.Connection, room_key: str, user_id: int) -> sqlite3.Row:
     room = connection.execute("SELECT * FROM rooms WHERE room_key = ?", (room_key,)).fetchone()
     if room is None:
@@ -93,7 +94,7 @@ def require_room(connection: sqlite3.Connection, room_key: str, user_id: int) ->
     return room
 
 
-# Build the public room object after access has been checked by its caller.
+# Build public room metadata/member names without including message history.
 # Membership refers to accounts, so multiple devices do not duplicate members.
 def _room_document(connection: sqlite3.Connection, room: sqlite3.Row) -> dict:
     members = connection.execute(
@@ -127,6 +128,49 @@ def open_private(connection: sqlite3.Connection, user_id: int, target_id: int) -
             )
     room = require_room(connection, room_key, user_id)
     return {"room": _room_document(connection, room), "created": created}
+
+
+# Publish all groups and their account members without revealing room messages.
+# Private rooms are excluded; ordering stays stable even for equal timestamps.
+def list_groups(connection: sqlite3.Connection) -> list[dict]:
+    rooms = connection.execute(
+        "SELECT * FROM rooms WHERE kind = 'group' ORDER BY created_at, room_key",
+    ).fetchall()
+    return [_room_document(connection, room) for room in rooms]
+
+
+# Create one UUID group and its creator membership in the same transaction.
+# The caller validates/normalizes the name; duplicate names are allowed.
+def create_group(connection: sqlite3.Connection, user_id: int, name: str) -> dict:
+    room_key = f"group:{uuid.uuid4()}"
+    timestamp = _timestamp()
+    with connection:
+        connection.execute(
+            "INSERT INTO rooms (room_key, kind, name, created_by, created_at) VALUES (?, 'group', ?, ?, ?)",
+            (room_key, name, user_id, timestamp),
+        )
+        connection.execute(
+            "INSERT INTO room_members (room_key, user_id, joined_at) VALUES (?, ?, ?)",
+            (room_key, user_id, timestamp),
+        )
+    return {"room": _room_document(connection, require_room(connection, room_key, user_id))}
+
+
+# Add only the caller's account to an existing group; repeating the request is safe.
+# Check existence/kind before membership, since non-members are allowed to join.
+# Membership changes leave the message/pin/heart revision unchanged.
+def join_group(connection: sqlite3.Connection, user_id: int, room_key: str) -> dict:
+    room = connection.execute("SELECT * FROM rooms WHERE room_key = ?", (room_key,)).fetchone()
+    if room is None:
+        raise ProtocolError("ROOM_NOT_FOUND", "Room not found")
+    if room["kind"] != "group":
+        raise ProtocolError("GROUP_REQUIRED", "Only group rooms can be joined")
+    with connection:
+        joined = connection.execute(
+            "INSERT INTO room_members (room_key, user_id, joined_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(room_key, user_id) DO NOTHING", (room_key, user_id, _timestamp()),
+        ).rowcount == 1
+    return {"room": _room_document(connection, room), "joined": joined}
 
 
 # Read bounded message rows with sender names, using only fixed SQL fragments

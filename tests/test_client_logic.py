@@ -33,7 +33,7 @@ class ClientLogicTests(unittest.TestCase):
         self.network.events.put(("response", response))
         self.logic.poll()
 
-    def join(self):
+    def join(self, groups=()):
         self.logic.connect("127.0.0.1", "5000", "Alice")
         self.factory.assert_called_once_with("127.0.0.1", 5000)
         self.network.start.assert_called_once()
@@ -42,7 +42,7 @@ class ClientLogicTests(unittest.TestCase):
         self.assertEqual(self.take("login"), {"username": "Alice"})
         self.reply({"user": self.alice})
         self.assertEqual(self.take("get_directory"), {})
-        self.reply({"online_users": [self.alice], "groups": []})
+        self.reply({"online_users": [self.alice], "groups": list(groups)})
         self.assertEqual(self.logic.state, "connected")
 
     def message(self, message_id, room_key="private:1:2"):
@@ -85,7 +85,7 @@ class ClientLogicTests(unittest.TestCase):
     def test_login_directory_and_ping_are_serialized_without_stacked_polls(self):
         self.join()
         self.assertEqual(self.logic.user, self.alice)
-        self.assertIn(("directory", [self.alice]), self.events)
+        self.assertIn(("directory", {"online_users": [self.alice], "groups": []}), self.events)
         self.logic.ping()
         self.assertEqual(self.take("ping"), {})
         self.clock.return_value = 104.0
@@ -181,3 +181,39 @@ class ClientLogicTests(unittest.TestCase):
         self.assertIsNone(self.logic.network)
         self.assertTrue(self.logic.closing)
         self.assertEqual(self.events, [])
+
+    def test_group_creation_refreshes_directory_before_initial_history(self):
+        self.join()
+        self.logic.create_group("  Study  ")
+        self.assertEqual(self.take("create_group"), {"name": "Study"})
+        group = {"room_key": "group:00000000-0000-4000-8000-000000000000", "kind": "group",
+                 "name": "Study", "created_by_user_id": 1, "created_at": "2026-11-08T00:00:00Z",
+                 "members": [self.alice]}
+        self.reply({"room": group})
+        self.assertEqual(self.take("get_directory"), {})
+        self.assertIn(("group_created", None), self.events)
+        self.assertIn(("room_title", "Group: Study"), self.events)
+        self.reply({"online_users": [self.alice], "groups": [group]})
+        request = self.take("sync_room")
+        self.assertEqual((request["room_key"], request["latest_id"], request["old_count"]), (group["room_key"], None, 20))
+        self.reply({**self.sync(), "room_key": group["room_key"]})
+        self.assertEqual(self.logic.groups, {group["room_key"]: group})
+        self.assertEqual(self.logic.latest_id, 0)
+
+    def test_stale_group_join_refreshes_discovery_without_replacing_new_private_target(self):
+        bob = {"id": 2, "username": "Bob"}
+        group = {"room_key": "group:00000000-0000-4000-8000-000000000000", "kind": "group",
+                 "name": "Study", "created_by_user_id": 2, "created_at": "2026-11-08T00:00:00Z", "members": [bob]}
+        self.join([group])
+        self.logic.open_group(group["room_key"])
+        self.assertEqual(self.take("join_group"), {"room_key": group["room_key"]})
+        self.logic.open_chat(3, "Carol")
+        self.reply({"room": {**group, "members": [self.alice, bob]}, "joined": True})
+        self.assertEqual(self.take("open_private"), {"target_user_id": 3})
+        self.assertIsNone(self.logic.room)
+        private = {"room_key": "private:1:3", "kind": "private", "name": None,
+                   "members": [self.alice, {"id": 3, "username": "Carol"}]}
+        self.reply({"room": private, "created": True})
+        self.assertEqual(self.take("get_directory"), {})
+        self.assertEqual(self.logic.room, private)
+        self.assertEqual(self.logic.messages, {})

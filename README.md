@@ -2,7 +2,7 @@
 
 A Computer Network term project using Python, Tkinter, and TCP sockets. The planned application includes private chats, group chats, and four additional features.
 
-**Current status:** The server and Tkinter client support username-only entry, persistent user IDs, a live online directory, private chat with persistent history, connection management, and ping. All 105 tests passed, including SQLite persistence, real TCP loopback, and Tkinter UI tests. Group chat, reactions, pins, AI, sound playback, and Docker images are not implemented yet.
+**Current status:** The server and Tkinter client support username-only entry, persistent user IDs, a live online directory, private and group chat with persistent history, connection management, and ping. All 124 tests passed, including SQLite persistence, real TCP loopback, and Tkinter UI tests. Reactions, pins, AI, sound playback, and Docker images are not implemented yet.
 
 ## Run the server
 
@@ -43,6 +43,14 @@ Opening a room loads its latest 20 messages. **Load older (20)** fetches the nex
 Only the active room is cached in client memory. Switching rooms clears that cache, fetches history again, and ignores replies belonging to an earlier room generation. Send acknowledgements do not append messages or advance the history cursor; the next sync supplies the complete ordered update. A send error retains the input for correction. Private messages remain stored when the other participant is offline, and rooms, memberships, and messages survive a server restart using the same database.
 
 This milestone sends human messages only. Heart/pin/AI/sound fields remain empty; revision-based snapshot reload is reserved for those later features. An unexpected room revision asks the user to reopen the chat rather than claiming that reload is implemented.
+
+## Group conversations
+
+Enter a **New group name** and choose **Create**. Names are trimmed to 1-80 Unicode characters, with no controls or line breaks; duplicate names are allowed because each group has a unique UUID key. A new group starts with its creator as its only member and opens automatically.
+
+Every logged-in user can see all groups. Select one to view its public member names, then explicitly choose **Join / Open** to join or reopen it. Selecting a group alone does not reveal its messages. Existing members can use the same button without creating duplicate memberships. Creating or joining refreshes the directory immediately; other clients see membership changes through the normal 3-second directory poll.
+
+Members can read the group's earlier history and send messages. The server rejects non-member reads/writes even when a caller knows the key. Membership and history survive logout and server restarts. Group history uses the same latest-20, older-20 and active-room polling behavior as private chats; changing rooms clears the previous message cache.
 
 ## Username identity
 
@@ -108,6 +116,7 @@ socket-chat/
     |-- test_client_network.py
     |-- test_client_ui.py
     |-- test_directory.py
+    |-- test_groups.py
     |-- test_login.py
     |-- test_protocol.py
     `-- test_server.py
@@ -115,7 +124,7 @@ socket-chat/
 
 Server responsibilities are split explicitly: `server_network.py` owns accept/recv/send, framing and connection deadlines; `server.py` owns the bounded work queue, sessions, application handlers and the SQLite worker. Transport calls `submit(request, session)` and returns its response on the same connection. Both share a shutdown Event so pending response waits can exit. Startup initializes storage before opening the listener; shutdown closes transport before joining the database worker.
 
-The server and client are separate files as required by the assignment. The current server implements ping, username-only login, logout, get_directory, open_private, send_message, sync_room, and transport error responses. The directory currently returns `groups: []` because group creation is not implemented yet. Known application actions without handlers return `ACTION_NOT_IMPLEMENTED`; this is not a complete implementation of Protocol v1.1.
+The server and client are separate files as required by the assignment. The current server implements ping, username-only login, logout, get_directory, open_private, create_group, join_group, send_message, sync_room, and transport error responses. The directory returns all groups with their members, including groups the caller has not joined. Known application actions without handlers return `ACTION_NOT_IMPLEMENTED`; this is not a complete implementation of Protocol v1.1.
 
 Local documentation distinguishes **confirmed**, **proposed**, and **unresolved** decisions. Confirming a design does not prove that it has been implemented or tested.
 

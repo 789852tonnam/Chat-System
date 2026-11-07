@@ -355,3 +355,61 @@ class ClientUITests(unittest.TestCase):
                              ["Earlier unseen message", "My own message"])
         finally:
             release.set()
+
+    def test_groups_show_members_before_join_and_two_windows_exchange_messages(self):
+        with patch("client_logic.DIRECTORY_POLL_INTERVAL", 0.2), patch("client_logic.ROOM_POLL_INTERVAL", 0.1):
+            server = self.server()
+            alice, bob = self.window(server), self.window(server, "Bob")
+            alice.connect()
+            bob.connect()
+            self.pump_until(alice, lambda: alice.logic.state == "connected" and bob.logic.user is not None)
+            alice.group_name.set("  Study  ")
+            alice.create_group_button.invoke()
+            self.pump_until(alice, lambda: len(alice.groups.get_children()) == 1 and len(bob.groups.get_children()) == 1)
+            key = alice.groups.get_children()[0]
+            self.assertEqual(alice.group_name.get(), "")
+            bob.groups.selection_set(key)
+            self.pump_until(bob, lambda: "Alice" in bob.group_members.get("1.0", "end"))
+            self.assertEqual(bob.logic.groups[key]["members"], [alice.logic.user])
+            self.assertIsNone(bob.logic.room)
+            self.assertEqual(bob.logic.messages, {})
+            bob.join_group_button.invoke()
+            self.pump_until(bob, lambda: bob.logic.room is not None and bob.logic.latest_id == 0
+                            and not bob.send_button.instate(["disabled"]))
+            self.assertEqual(bob.room_title.get(), "Group: Study")
+            bob.message_input.insert("1.0", "Hello group")
+            bob.send_button.invoke()
+            self.pump_until(alice, lambda: len(alice.logic.messages) == 1 and len(bob.logic.messages) == 1
+                            and len(alice.logic.groups[key]["members"]) == 2)
+            self.assertIn("Bob: Hello group", alice.chat.get("1.0", "end"))
+            self.assertIn("Bob: Hello group", bob.chat.get("1.0", "end"))
+            self.assertEqual(alice.groups.selection(), (key,))
+            self.assertIn("Bob", alice.group_members.get("1.0", "end"))
+            self.assertEqual(bob.groups.item(key, "text"), "Study (joined)")
+            bob.disconnect()
+            self.pump_until(bob, lambda: bob.logic.network is None)
+            self.assertEqual(bob.groups.get_children(), ())
+
+    def test_group_history_pages_and_switching_to_private_room_keep_caches_separate(self):
+        server = self.server()
+        alice, bob = self.raw_peer(server, "Alice"), self.raw_peer(server, "Bob")
+        group = alice.ok("create_group", {"name": "History"})["room"]["room_key"]
+        for index in range(35):
+            alice.ok("send_message", {"room_key": group, "content": f"Group history {index}"})
+        private = alice.ok("open_private", {"target_user_id": bob.user["id"]})["room"]["room_key"]
+        bob.ok("send_message", {"room_key": private, "content": "Private only"})
+        window = self.window(server, "Bob")
+        window.connect()
+        self.pump_until(window, lambda: window.groups.exists(group))
+        window.groups.selection_set(group)
+        window.join_group_button.invoke()
+        self.pump_until(window, lambda: len(window.logic.messages) == 20 and window.logic.state == "connected")
+        window.older_button.invoke()
+        self.pump_until(window, lambda: len(window.logic.messages) == 35 and window.logic.state == "connected")
+        self.open_room(window, alice.user["id"])
+        self.assertEqual([message["content"] for message in window.logic.messages.values()], ["Private only"])
+        self.assertNotIn("Group history", window.chat.get("1.0", "end"))
+        window.groups.selection_set(group)
+        window.join_group_button.invoke()
+        self.pump_until(window, lambda: len(window.logic.messages) == 20 and window.logic.state == "connected")
+        self.assertNotIn("Private only", window.chat.get("1.0", "end"))

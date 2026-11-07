@@ -18,6 +18,7 @@ from common.protocol import (
     decode_document,
     encode_message,
     validate_directory,
+    validate_group_name,
     validate_message,
     validate_response,
     validate_room,
@@ -91,9 +92,21 @@ class NetworkClient(threading.Thread):
                             user_id = None
                         elif action == "open_private" and response["ok"]:
                             room = validate_room(response["data"].get("room"))
-                            if ({member["id"] for member in room["members"]} != {user_id, payload["target_user_id"]}
+                            if (room["kind"] != "private"
+                                    or {member["id"] for member in room["members"]} != {user_id, payload["target_user_id"]}
                                     or type(response["data"].get("created")) is not bool):
                                 raise ProtocolError("INVALID_RESPONSE", "Private room has unexpected participants")
+                        elif action in {"create_group", "join_group"} and response["ok"]:
+                            room = validate_room(response["data"].get("room"))
+                            ids = [member["id"] for member in room["members"]]
+                            if room["kind"] != "group" or user_id not in ids:
+                                raise ProtocolError("INVALID_RESPONSE", "Group response must include this user")
+                            if action == "create_group":
+                                if (ids != [user_id] or room["created_by_user_id"] != user_id
+                                        or room["name"] != validate_group_name(payload["name"])):
+                                    raise ProtocolError("INVALID_RESPONSE", "Created group has unexpected name or members")
+                            elif room["room_key"] != payload["room_key"] or type(response["data"].get("joined")) is not bool:
+                                raise ProtocolError("INVALID_RESPONSE", "Invalid group join response")
                         elif action == "send_message" and response["ok"]:
                             message = validate_message(response["data"].get("message"), payload["room_key"])
                             if message["sender"]["id"] != user_id:

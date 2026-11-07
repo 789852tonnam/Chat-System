@@ -30,6 +30,10 @@ class ClientWindow(tk.Tk):
         self.username = tk.StringVar()
         # Presentation text for the online list, room header and connection state.
         self.directory_status = tk.StringVar(value="Online users (0)")
+        # Public group count and editable creation form; metadata stays in logic.
+        self.group_status = tk.StringVar(value="Groups (0)")
+        # Cleared only after the server confirms successful group creation.
+        self.group_name = tk.StringVar()
         # Updated from room-title events; room metadata belongs to logic.
         self.room_title = tk.StringVar(value="Select an online user and open a chat")
         # Updated by _render_state() or a form validation error.
@@ -78,18 +82,45 @@ class ClientWindow(tk.Tk):
         content.columnconfigure(1, weight=1)
         content.rowconfigure(1, weight=1)
         ttk.Label(content, textvariable=self.directory_status).grid(row=0, column=0, sticky="w", pady=(0, 4))
-        ttk.Label(content, text="Private chat").grid(row=0, column=1, sticky="w", pady=(0, 4))
+        ttk.Label(content, text="Conversation").grid(row=0, column=1, sticky="w", pady=(0, 4))
         # Native list/scrollbar controls keep large online lists keyboard-accessible.
         people = ttk.Frame(content)
         people.grid(row=1, column=0, sticky="nsew", padx=(0, 12))
+        people.columnconfigure(0, weight=1)
+        people.rowconfigure(0, weight=1)
+        people.rowconfigure(2, weight=1)
         # Stable item IDs preserve selection across full directory snapshots.
-        self.online_users = ttk.Treeview(people, show="tree", height=12, selectmode="browse")
-        self.online_users.column("#0", width=160, minwidth=120, stretch=False)
-        self.online_users.pack(side="left", fill="both", expand=True)
+        self.online_users = ttk.Treeview(people, show="tree", height=5, selectmode="browse")
+        self.online_users.column("#0", width=200, minwidth=160, stretch=True)
+        self.online_users.grid(row=0, column=0, sticky="nsew")
         # Scroll only the online list, independently of activity output.
         online_scroll = ttk.Scrollbar(people, orient="vertical", command=self.online_users.yview)
-        online_scroll.pack(side="right", fill="y")
+        online_scroll.grid(row=0, column=1, sticky="ns")
         self.online_users.configure(yscrollcommand=online_scroll.set)
+        ttk.Label(people, textvariable=self.group_status).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 4))
+        # All groups remain visible before joining; UUID item IDs preserve selection.
+        self.groups = ttk.Treeview(people, show="tree", height=5, selectmode="browse")
+        self.groups.column("#0", width=200, minwidth=160, stretch=True)
+        self.groups.grid(row=2, column=0, sticky="nsew")
+        group_scroll = ttk.Scrollbar(people, orient="vertical", command=self.groups.yview)
+        group_scroll.grid(row=2, column=1, sticky="ns")
+        self.groups.configure(yscrollcommand=group_scroll.set)
+        self.groups.bind("<<TreeviewSelect>>", lambda event: self._show_group_members())
+        ttk.Label(people, text="Group members").grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 4))
+        # Scrollable public member names do not expose the group's messages.
+        self.group_members = ScrolledText(people, width=24, height=3, wrap="word", state="disabled")
+        self.group_members.grid(row=4, column=0, columnspan=2, sticky="ew")
+        ttk.Label(people, text="New group name").grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 4))
+        self.group_name_entry = ttk.Entry(people, textvariable=self.group_name)
+        self.group_name_entry.grid(row=6, column=0, columnspan=2, sticky="ew")
+        group_buttons = ttk.Frame(people)
+        group_buttons.grid(row=7, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        # Creation starts with this user only; selection never auto-joins a group.
+        self.create_group_button = ttk.Button(group_buttons, text="Create", command=self.create_group)
+        self.create_group_button.pack(side="left")
+        # Existing members reuse the same action to open their saved history.
+        self.join_group_button = ttk.Button(group_buttons, text="Join / Open", command=self.open_group)
+        self.join_group_button.pack(side="left", padx=(6, 0))
         # Chat grows with the window; the activity log stays a small diagnostic area.
         conversation = ttk.Frame(content)
         conversation.grid(row=1, column=1, sticky="nsew")
@@ -141,6 +172,16 @@ class ClientWindow(tk.Tk):
             target = int(selected[0].removeprefix("user-"))
             self.logic.open_chat(target, self.online_users.item(selected[0], "text"))
 
+    # Pass the plain creation form value to logic for shared name validation.
+    def create_group(self) -> None:
+        self.logic.create_group(self.group_name.get())
+
+    # Joining requires an explicit button press after selecting a public group.
+    def open_group(self) -> None:
+        selected = self.groups.selection()
+        if selected:
+            self.logic.open_group(selected[0])
+
     # Read the composer; logic validates content and queues the send request.
     def send(self) -> None:
         self.logic.send(self.message_input.get("1.0", "end-1c"))
@@ -181,6 +222,8 @@ class ClientWindow(tk.Tk):
         elif kind == "sent":
             self.message_input.configure(state="normal")
             self.message_input.delete("1.0", "end")
+        elif kind == "group_created":
+            self.group_name.set("")
         elif kind == "closed":
             if self._poll_id is not None:
                 self.after_cancel(self._poll_id)
@@ -225,7 +268,8 @@ class ClientWindow(tk.Tk):
     # Apply a validated full snapshot on the main thread, marking this user's row.
     # Reuse existing Treeview items to retain selection and remove offline users.
     # The server has already sorted/deduplicated identities across connections.
-    def _update_directory(self, users: list[dict]) -> None:
+    def _update_directory(self, data: dict) -> None:
+        users = data["online_users"]
         removed = set(self.online_users.get_children())
         for position, user in enumerate(users):
             key = f"user-{user['id']}"
@@ -240,6 +284,36 @@ class ClientWindow(tk.Tk):
         for key in removed:
             self.online_users.delete(key)
         self.directory_status.set(f"Online users ({len(users)})")
+        removed = set(self.groups.get_children())
+        for position, group in enumerate(data["groups"]):
+            key = group["room_key"]
+            joined = self.logic.user is not None and any(member["id"] == self.logic.user["id"] for member in group["members"])
+            text = group["name"] + (" (joined)" if joined else "")
+            if self.groups.exists(key):
+                self.groups.item(key, text=text)
+            else:
+                self.groups.insert("", "end", iid=key, text=text)
+            self.groups.move(key, "", position)
+            removed.discard(key)
+        for key in removed:
+            self.groups.delete(key)
+        if not self.groups.selection() and self.logic.room is not None and self.logic.room["kind"] == "group":
+            key = self.logic.room["room_key"]
+            if self.groups.exists(key):
+                self.groups.selection_set(key)
+        self.group_status.set(f"Groups ({len(data['groups'])})")
+        self._show_group_members()
+
+    # Display names for the selected public group, even before this user joins.
+    # Re-render after directory snapshots so new memberships appear while selected.
+    def _show_group_members(self) -> None:
+        selected = self.groups.selection()
+        group = self.logic.groups.get(selected[0]) if selected else None
+        text = ", ".join(member["username"] for member in group["members"]) if group else "Select a group to view members."
+        self.group_members.configure(state="normal")
+        self.group_members.delete("1.0", "end")
+        self.group_members.insert("1.0", text)
+        self.group_members.configure(state="disabled")
 
     # Keep status text, button availability, and form editability in sync.
     # Only the disconnected state allows a new address or connection attempt.
@@ -249,7 +323,8 @@ class ClientWindow(tk.Tk):
         self.status.set({
             "waiting": "Waiting for pong...", "joining": "Joining...",
             "refreshing": "Refreshing online users...",
-            "opening": "Opening private chat...", "syncing": "Loading messages...",
+            "opening": "Opening conversation...", "syncing": "Loading messages...",
+            "creating": "Creating group...",
             "sending": "Sending message...",
             "connected": f"Joined as {self.logic.user['username']}" if self.logic.user else "Connected",
         }.get(state, state.capitalize()))
@@ -260,6 +335,9 @@ class ClientWindow(tk.Tk):
         self.ping_button.configure(state="normal" if state == "connected" else "disabled")
         active = self.logic.user is not None and state not in {"disconnected", "disconnecting", "closing"}
         self.open_button.configure(state="normal" if active else "disabled")
+        self.join_group_button.configure(state="normal" if active else "disabled")
+        self.create_group_button.configure(state="normal" if active and state == "connected" else "disabled")
+        self.group_name_entry.configure(state="normal" if active and state != "creating" else "disabled")
         can_send = active and self.logic.room is not None and state == "connected"
         self.send_button.configure(state="normal" if can_send else "disabled")
         self.older_button.configure(state="normal" if can_send and self.logic.has_more_older else "disabled")
