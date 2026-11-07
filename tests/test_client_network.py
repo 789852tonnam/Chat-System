@@ -8,12 +8,14 @@ from unittest.mock import patch
 from client_network import NetworkClient
 from common.protocol import MAX_RESPONSE_BYTES, encode_message
 from server import ChatServer, ServerConfig
+from server_network import ServerNetwork
 from test_chat import ChatPeer, initial_sync
 
 
 class ClientNetworkTests(unittest.TestCase):
-    def server(self, server_class=ChatServer):
-        server = server_class(ServerConfig(host="127.0.0.1", port=0, database_path=":memory:"))
+    def server(self, server_class=ChatServer, *, network_class=ServerNetwork):
+        with patch("server.ServerNetwork", network_class):
+            server = server_class(ServerConfig(host="127.0.0.1", port=0, database_path=":memory:"))
         server.start()
         self.addCleanup(server.stop)
         return server
@@ -70,13 +72,13 @@ class ClientNetworkTests(unittest.TestCase):
         self.assertEqual(self.event(client, "response")["data"], {"online_users": [user], "groups": []})
 
     def test_invalid_directory_response_closes_connection(self):
-        class InvalidDirectoryServer(ChatServer):
+        class InvalidDirectoryNetwork(ServerNetwork):
             def _send_response(self, connection, response):
                 if response["ok"] and "online_users" in response["data"]:
                     response["data"]["online_users"] = [None]
                 return super()._send_response(connection, response)
 
-        client = self.client(self.server(InvalidDirectoryServer))
+        client = self.client(self.server(network_class=InvalidDirectoryNetwork))
         client.requests.put(("login", {"username": "Alice"}))
         self.event(client, "response")
         client.requests.put(("get_directory", {}))
@@ -87,14 +89,14 @@ class ClientNetworkTests(unittest.TestCase):
         for user in [None, {"id": True, "username": "Alice"},
                      {"id": 1, "username": "invalid name"}]:
             with self.subTest(user=user):
-                class InvalidUserServer(ChatServer):
+                class InvalidUserNetwork(ServerNetwork):
                     def _send_response(self, connection, response):
                         connection.sendall(encode_message({
                             "request_id": response["request_id"], "ok": True, "data": {"user": user},
                         }))
                         return True
 
-                client = self.client(self.server(InvalidUserServer))
+                client = self.client(self.server(network_class=InvalidUserNetwork))
                 client.requests.put(("login", {"username": "Alice"}))
                 self.assertIn("invalid", self.event(client, "error"))
                 self.event(client, "disconnected")
@@ -147,14 +149,14 @@ class ClientNetworkTests(unittest.TestCase):
         wire = encode_message({"request_id": 1, "ok": True, "data": {"text": "\u0e44\u0e17\u0e22"}})
         split = wire.index("\u0e44".encode()) + 1
 
-        class FragmentedServer(ChatServer):
+        class FragmentedNetwork(ServerNetwork):
             def _send_response(self, connection, response):
                 connection.sendall(wire[:split])
                 time.sleep(0.02)
                 connection.sendall(wire[split:])
                 return True
 
-        client = self.client(self.server(FragmentedServer))
+        client = self.client(self.server(network_class=FragmentedNetwork))
         client.requests.put(("ping", {}))
         self.assertEqual(self.event(client, "response")["data"]["text"], "\u0e44\u0e17\u0e22")
 
@@ -168,7 +170,7 @@ class ClientNetworkTests(unittest.TestCase):
             b'{"request_id":1,"ok":true,"data":{}}\n{}\n',
         ]:
             with self.subTest(wire_prefix=wire[:80]):
-                class InvalidServer(ChatServer):
+                class InvalidNetwork(ServerNetwork):
                     def _send_response(self, connection, response):
                         try:
                             connection.sendall(wire)
@@ -176,14 +178,14 @@ class ClientNetworkTests(unittest.TestCase):
                             pass
                         return False
 
-                client = self.client(self.server(InvalidServer))
+                client = self.client(self.server(network_class=InvalidNetwork))
                 client.requests.put(("ping", {}))
                 self.assertTrue(self.event(client, "error"))
                 self.event(client, "disconnected")
                 self.stop_client(client)
 
     def test_partial_bytes_do_not_extend_total_response_deadline(self):
-        class SlowServer(ChatServer):
+        class SlowNetwork(ServerNetwork):
             def _send_response(self, connection, response):
                 try:
                     connection.sendall(b'{')
@@ -194,7 +196,7 @@ class ClientNetworkTests(unittest.TestCase):
                     pass
                 return False
 
-        client = self.client(self.server(SlowServer), request_timeout=0.08)
+        client = self.client(self.server(network_class=SlowNetwork), request_timeout=0.08)
         client.requests.put(("ping", {}))
         self.assertIn("timed out", self.event(client, "error"))
         self.event(client, "disconnected")

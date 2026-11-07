@@ -7,9 +7,11 @@ import socket
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 from common.protocol import MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, encode_message
 from server import ChatServer, ServerConfig
+from server_network import ServerNetwork
 
 
 class Peer:
@@ -63,6 +65,88 @@ class ServerTests(unittest.TestCase):
 
     def assert_pong(self, peer, request_id):
         self.assertEqual(peer.read(), {"request_id": request_id, "ok": True, "data": {"pong": True}})
+
+    def test_transport_works_with_callback_without_application_worker(self):
+        calls = []
+
+        def submit(request, session):
+            calls.append((request, session))
+            return {"request_id": request.request_id, "ok": True, "data": {"pong": True}}
+
+        network = ServerNetwork(
+            submit, threading.Event(), host="127.0.0.1", port=0,
+            frame_timeout=10, idle_timeout=120, send_timeout=10,
+        )
+        self.addCleanup(network.stop)
+        with self.assertRaises(RuntimeError):
+            _ = network.address
+        network.start()
+        with Peer(network.address) as peer:
+            for request_id in (1, 2):
+                peer.send(request_id)
+                self.assert_pong(peer, request_id)
+            self.assertIs(calls[0][1], calls[1][1])
+            network.stop()
+            self.assertTrue(calls[0][1].closed.is_set())
+            self.assertTrue(peer.is_closed())
+        self.assertFalse(network._acceptor.is_alive())
+        self.assertFalse(network._connections)
+
+    def test_listener_startup_failure_closes_initialized_database_worker(self):
+        with socket.create_server(("127.0.0.1", 0)) as occupied:
+            server = ChatServer(ServerConfig(
+                host="127.0.0.1", port=occupied.getsockname()[1], database_path=":memory:",
+            ))
+            self.addCleanup(server.stop)
+            with self.assertRaises(OSError):
+                server.start()
+        self.assertTrue(server._worker_ready.is_set())
+        self.assertFalse(server._worker.is_alive())
+        self.assertIsNone(server._database)
+        self.assertIsNone(server._network._listener)
+        with self.assertRaises(RuntimeError):
+            server.start()
+
+    def test_interrupt_during_transport_startup_cleans_up_worker(self):
+        server = ChatServer(ServerConfig(database_path=":memory:"))
+        self.addCleanup(server.stop)
+        with patch.object(server._network, "start", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                server.start()
+        self.assertTrue(server._stopping.is_set())
+        self.assertFalse(server._worker.is_alive())
+        self.assertIsNone(server._database)
+
+    def test_shutdown_releases_io_waiting_for_a_running_handler(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        class WaitingServer(ChatServer):
+            def _handle_request(self, request, session):
+                entered.set()
+                release.wait(5)
+                return super()._handle_request(request, session)
+
+        server = self.start(WaitingServer)
+        peer = self.peer(server)
+        peer.send()
+        self.assertTrue(entered.wait(2))
+        with server._network._connections_lock:
+            io_threads = list(server._network._connections.values())
+        stopper = threading.Thread(target=server.stop)
+        stopper.start()
+        try:
+            self.assertTrue(server._stopping.wait(1))
+            for thread in io_threads:
+                thread.join(1)
+                self.assertFalse(thread.is_alive())
+            self.assertTrue(server._worker.is_alive())
+            self.assertTrue(peer.is_closed())
+        finally:
+            release.set()
+            stopper.join(3)
+        self.assertFalse(stopper.is_alive())
+        self.assertIsNone(server._database)
 
     def test_multiple_buffered_requests_keep_response_order(self):
         peer = self.peer(self.start())
@@ -255,7 +339,7 @@ class ServerTests(unittest.TestCase):
         server.stop()
         self.assertTrue(peer.is_closed())
         self.assertFalse(server._worker.is_alive())
-        self.assertFalse(server._acceptor.is_alive())
+        self.assertFalse(server._network._acceptor.is_alive())
         server.stop()  # Idempotent shutdown is safe for finally/cleanup callers.
 
     def test_oversized_response_becomes_a_bounded_error(self):

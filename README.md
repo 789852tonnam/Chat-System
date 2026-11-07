@@ -2,7 +2,7 @@
 
 A Computer Network term project using Python, Tkinter, and TCP sockets. The planned application includes private chats, group chats, and four additional features.
 
-**Current status:** The server and Tkinter client support username-only entry, persistent user IDs, a live online directory, private chat with persistent history, connection management, and ping. All 94 tests passed, including SQLite persistence, real TCP loopback, and Tkinter UI tests. Group chat, reactions, pins, AI, sound playback, and Docker images are not implemented yet.
+**Current status:** The server and Tkinter client support username-only entry, persistent user IDs, a live online directory, private chat with persistent history, connection management, and ping. All 98 tests passed, including SQLite persistence, real TCP loopback, and Tkinter UI tests. Group chat, reactions, pins, AI, sound playback, and Docker images are not implemented yet.
 
 ## Run the server
 
@@ -93,7 +93,8 @@ The links in the following tables refer to ignored files available in the develo
 socket-chat/
 |-- .gitignore
 |-- README.md
-|-- server.py                # TCP server and single application worker
+|-- server.py                # Lifecycle, queue, application worker and handlers
+|-- server_network.py        # TCP listener, connection threads and framing
 |-- database.py              # Worker-owned SQLite users, rooms and messages
 |-- client.py                # Tkinter UI and main-thread event handling
 |-- client_network.py        # Socket worker and request/result queues
@@ -109,6 +110,8 @@ socket-chat/
     |-- test_protocol.py
     `-- test_server.py
 ```
+
+Server responsibilities are split explicitly: `server_network.py` owns accept/recv/send, framing and connection deadlines; `server.py` owns the bounded work queue, sessions, application handlers and the SQLite worker. Transport calls `submit(request, session)` and returns its response on the same connection. Both share a shutdown Event so pending response waits can exit. Startup initializes storage before opening the listener; shutdown closes transport before joining the database worker.
 
 The server and client are separate files as required by the assignment. The current server implements ping, username-only login, logout, get_directory, open_private, send_message, sync_room, and transport error responses. The directory currently returns `groups: []` because group creation is not implemented yet. Known application actions without handlers return `ACTION_NOT_IMPLEMENTED`; this is not a complete implementation of Protocol v1.1.
 

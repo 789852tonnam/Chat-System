@@ -111,15 +111,15 @@ class LoginTests(unittest.TestCase):
         server.stop()
         self.assertIsNone(server._database)
 
-    def test_database_startup_failure_closes_listener_and_worker(self):
+    def test_database_startup_failure_never_starts_transport(self):
         directory = self.resources.enter_context(tempfile.TemporaryDirectory())
         server = ChatServer(ServerConfig(host="127.0.0.1", port=0, database_path=directory))
         self.addCleanup(server.stop)
         with self.assertRaises(sqlite3.OperationalError):
             server.start()
-        self.assertEqual(server._listener.fileno(), -1)
+        self.assertIsNone(server._network._listener)
         self.assertFalse(server._worker.is_alive())
-        self.assertIsNone(server._acceptor)
+        self.assertIsNone(server._network._acceptor)
 
     def test_database_error_does_not_bind_identity_or_kill_worker(self):
         peer = self.peer(self.server())
