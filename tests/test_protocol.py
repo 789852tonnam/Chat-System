@@ -12,6 +12,7 @@ from common.protocol import (
     encode_message,
     read_request_id,
     validate_envelope,
+    validate_directory,
     validate_response,
     validate_username,
 )
@@ -136,3 +137,23 @@ class ResponseValidationTests(unittest.TestCase):
         ]:
             with self.subTest(response=response), self.assertRaises(ProtocolError):
                 validate_response(response, 1)
+
+
+class DirectoryValidationTests(unittest.TestCase):
+    def test_valid_directory_keeps_public_user_fields(self):
+        data = {"online_users": [{"id": 1, "username": "Alice"}], "groups": []}
+        self.assertIs(validate_directory(data), data)
+        self.assertEqual(validate_directory({"online_users": [], "groups": []})["online_users"], [])
+
+    def test_invalid_users_lists_and_duplicates_are_rejected(self):
+        alice = {"id": 1, "username": "Alice"}
+        for data in [
+            {}, {"online_users": None, "groups": []}, {"online_users": [], "groups": None},
+            {"online_users": [None], "groups": []},
+            {"online_users": [{"id": True, "username": "Alice"}], "groups": []},
+            {"online_users": [{"id": 1, "username": "invalid name"}], "groups": []},
+            {"online_users": [alice, alice], "groups": []},
+            {"online_users": [alice, {"id": 2, "username": "ALICE"}], "groups": []},
+        ]:
+            with self.subTest(data=data), self.assertRaises(ProtocolError):
+                validate_directory(data)

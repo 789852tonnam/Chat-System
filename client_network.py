@@ -17,8 +17,9 @@ from common.protocol import (
     ProtocolError,
     decode_document,
     encode_message,
+    validate_directory,
     validate_response,
-    validate_username,
+    validate_user,
 )
 
 
@@ -79,16 +80,9 @@ class NetworkClient(threading.Thread):
                     })
                     if response is not None:
                         if action == "login" and response["ok"]:
-                            user = response["data"].get("user")
-                            if (type(user) is not dict or type(user.get("id")) is not int
-                                    or not 1 <= user["id"] <= MAX_REQUEST_ID):
-                                raise ProtocolError("INVALID_RESPONSE", "Login response contains an invalid user")
-                            try:
-                                validate_username(user.get("username"))
-                            except ProtocolError:
-                                raise ProtocolError(
-                                    "INVALID_RESPONSE", "Login response contains an invalid username",
-                                ) from None
+                            validate_user(response["data"].get("user"))
+                        elif action == "get_directory" and response["ok"]:
+                            validate_directory(response["data"])
                         self.events.put(("response", response))
         except (OSError, ProtocolError, FrameTooLarge, ValueError) as exc:
             if not self._stopping.is_set():

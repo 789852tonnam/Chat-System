@@ -2,7 +2,7 @@
 
 A Computer Network term project using Python, Tkinter, and TCP sockets. The planned application includes private chats, group chats, and four additional features.
 
-**Current status:** The server and Tkinter client support username-only entry, persistent user IDs, connection management, and ping. All 60 tests passed, including SQLite persistence, real TCP loopback, and Tkinter UI tests. Rooms, chat, online lists, and Docker images are not implemented yet.
+**Current status:** The server and Tkinter client support username-only entry, persistent user IDs, a live online directory, connection management, and ping. All 72 tests passed, including SQLite persistence, real TCP loopback, and Tkinter UI tests. Rooms, chat, groups, and Docker images are not implemented yet.
 
 ## Run the server
 
@@ -28,7 +28,9 @@ Enter a username, select **Join**, then **Send Ping**, and check Activity for th
 
 `client.py` owns the UI. `client_network.py` owns the socket and network thread. Requests and results pass through queues: the network module never imports Tkinter, and the UI never performs socket I/O. Both client and server receive data with `recv()` and assemble complete JSON lines with `LineFramer`.
 
-This client slice does not poll automatically. If the server closes an idle connection, the client detects it on the next request. Reconnect explicitly with **Join**; the client sends a fresh login request. Requests are never retried automatically.
+The online list includes your own name, marked `(you)`, and shows each user once even when that identity has multiple connections. It refreshes immediately after Join, then every 3 seconds after a snapshot returns. Polls wait for any request already in flight and never accumulate. While refreshing, Ping is temporarily disabled; Disconnect and window close remain available. Selection is preserved for users who remain online.
+
+Logging out or closing the last connection removes that user from later snapshots. Disconnected sessions are removed by the server worker before requests and during idle maintenance; stored users remain in SQLite. Background polling keeps healthy idle clients active. If a connection fails, the client reports the error and clears the online list. Reconnect explicitly with **Join**. Requests are never retried automatically.
 
 See the local [Client guide](docs/client.md) for details. The `docs/`, `diagram/`, and `GLOSSARY.md` paths are ignored by Git and exist only in the development workspace; they are not included in a Git checkout.
 
@@ -91,12 +93,13 @@ socket-chat/
 `-- tests/                   # Protocol, TCP, and Tkinter interaction tests
     |-- test_client_network.py
     |-- test_client_ui.py
+    |-- test_directory.py
     |-- test_login.py
     |-- test_protocol.py
     `-- test_server.py
 ```
 
-The server and client are separate files as required by the assignment. The current server implements ping, username-only login, logout, and transport error responses. Known application actions without handlers return `ACTION_NOT_IMPLEMENTED`; this is not a complete implementation of Protocol v1.1.
+The server and client are separate files as required by the assignment. The current server implements ping, username-only login, logout, get_directory, and transport error responses. The directory currently returns `groups: []` because group creation is not implemented yet. Known application actions without handlers return `ACTION_NOT_IMPLEMENTED`; this is not a complete implementation of Protocol v1.1.
 
 Local documentation distinguishes **confirmed**, **proposed**, and **unresolved** decisions. Confirming a design does not prove that it has been implemented or tested.
 

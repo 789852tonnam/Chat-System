@@ -59,10 +59,13 @@ class ServerConfig:
                 raise ValueError(f"{name} must be finite and positive")
 
 
-@dataclass(slots=True)
+# Session identity is its connection, even when two sessions share the same user.
+@dataclass(slots=True, eq=False)
 class ClientSession:
     # Only the application worker changes the identity bound to this connection.
     user: dict[str, Any] | None = None
+    # I/O signals closure; the worker alone updates the online-session registry.
+    closed: threading.Event = field(default_factory=threading.Event)
 
 
 @dataclass(slots=True)
@@ -105,6 +108,8 @@ class ChatServer:
         self._worker_start_error: Exception | None = None
         # Created, used, and closed exclusively on the application worker thread.
         self._database: sqlite3.Connection | None = None
+        # Worker-owned active logins; multiple sessions may refer to one user ID.
+        self._sessions: set[ClientSession] = set()
         # Thread running _accept_loop() to accept new clients.
         self._acceptor: threading.Thread | None = None
         # Prevents starting this server instance more than once.
@@ -288,6 +293,7 @@ class ChatServer:
             # A disconnected client must not stop the acceptor or other clients.
             pass
         finally:
+            session.closed.set()
             self._close_socket(connection)
             with self._connections_lock:
                 self._connections.pop(connection, None)
@@ -327,13 +333,14 @@ class ChatServer:
                 try:
                     item = self._work.get(timeout=1.0)
                 except queue.Empty:
-                    # Reserved for the agreed single-worker maintenance tick.
+                    self._prune_sessions()
                     continue
                 try:
                     if item is _STOP:
                         return
                     assert isinstance(item, WorkItem)
                     try:
+                        self._prune_sessions()
                         item.response = self._handle_request(item.request, item.session)
                     except ProtocolError as exc:
                         item.response = error_response(item.request.request_id, exc.code, exc.message)
@@ -347,8 +354,15 @@ class ChatServer:
                 finally:
                     self._work.task_done()
         finally:
+            self._sessions.clear()
             self._database.close()
             self._database = None
+
+    # Remove closed connections on the worker, without sharing a mutable registry
+    # with I/O threads. Run before requests and on the idle maintenance tick.
+    # Persistent users stay in SQLite; this only changes online visibility.
+    def _prune_sessions(self) -> None:
+        self._sessions = {session for session in self._sessions if not session.closed.is_set()}
 
     # Dispatch an application request on the worker thread; do not send socket data.
     # Unknown names return UNKNOWN_ACTION; known but unfinished actions explicitly
@@ -359,7 +373,7 @@ class ChatServer:
         """Only the central worker calls application handlers."""
         if request.action not in KNOWN_ACTIONS:
             return error_response(request.request_id, "UNKNOWN_ACTION", "Unknown action")
-        if request.action not in {"ping", "login", "logout"}:
+        if request.action not in {"ping", "login", "logout", "get_directory"}:
             return error_response(
                 request.request_id,
                 "ACTION_NOT_IMPLEMENTED",
@@ -373,12 +387,21 @@ class ChatServer:
             username = validate_username(request.payload["username"])
             assert self._database is not None
             session.user = get_or_create_user(self._database, username)
+            self._sessions.add(session)
             return success_response(request.request_id, {"user": session.user})
+        if request.action == "get_directory" and session.user is None:
+            raise ProtocolError("UNAUTHENTICATED", "Join with a username before requesting the directory")
         if request.payload:
             raise ProtocolError("INVALID_PAYLOAD", f"{request.action} requires an empty payload")
         if request.action == "logout":
+            self._sessions.discard(session)
             session.user = None
             return success_response(request.request_id, {"logged_out": True})
+        if request.action == "get_directory":
+            users = {active.user["id"]: active.user for active in self._sessions}
+            online_users = sorted(users.values(), key=lambda user: (user["username"].lower(), user["id"]))
+            # No groups exist yet; create_group remains explicitly unimplemented.
+            return success_response(request.request_id, {"online_users": online_users, "groups": []})
         return success_response(request.request_id, {"pong": True})
 
     # Run on the server I/O thread assigned to this client and encode its response.

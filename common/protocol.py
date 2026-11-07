@@ -189,6 +189,37 @@ def validate_username(username: Any) -> str:
     return username
 
 
+# Validate the public user fields returned by login and directory responses.
+# Share this check so both actions reject invalid IDs and display names before
+# the UI receives them; additional user fields may be ignored by older clients.
+def validate_user(user: Any) -> dict[str, Any]:
+    if type(user) is not dict or type(user.get("id")) is not int or not 1 <= user["id"] <= MAX_REQUEST_ID:
+        raise ProtocolError("INVALID_RESPONSE", "Response contains an invalid user")
+    try:
+        validate_username(user.get("username"))
+    except ProtocolError:
+        raise ProtocolError("INVALID_RESPONSE", "Response contains an invalid username") from None
+    return user
+
+
+# Check the online list before passing a directory snapshot to Tkinter.
+# Names and IDs must be unique; multiple connections are represented once.
+# Groups are only checked as a list until group handling is implemented.
+def validate_directory(data: dict[str, Any]) -> dict[str, Any]:
+    if type(data.get("online_users")) is not list or type(data.get("groups")) is not list:
+        raise ProtocolError("INVALID_RESPONSE", "Directory must contain online_users and groups lists")
+    ids = set()
+    names = set()
+    for value in data["online_users"]:
+        user = validate_user(value)
+        name = user["username"].lower()
+        if user["id"] in ids or name in names:
+            raise ProtocolError("INVALID_RESPONSE", "Directory contains duplicate users")
+        ids.add(user["id"])
+        names.add(name)
+    return data
+
+
 # Validate a parsed response against the client's one outstanding request ID.
 # Require boolean ok and the matching success/error fields, while allowing
 # additional response fields for compatibility with the protocol contract.

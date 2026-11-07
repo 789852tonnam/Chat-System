@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import argparse
 import queue
+import time
 import tkinter as tk
 from tkinter import ttk
 from tkinter.scrolledtext import ScrolledText
 
 from client_network import NetworkClient
 from common.protocol import ProtocolError, validate_username
+
+
+# Schedule the next directory request after the previous snapshot is received.
+DIRECTORY_POLL_INTERVAL = 3.0
 
 
 class ClientWindow(tk.Tk):
@@ -21,7 +26,7 @@ class ClientWindow(tk.Tk):
     def __init__(self, host: str = "127.0.0.1", port: int = 5000):
         super().__init__()
         self.title("Socket Chat - Join")
-        self.minsize(640, 360)
+        self.minsize(720, 400)
         # A new worker is created for each explicit connection attempt.
         self.network: NetworkClient | None = None
         # UI state controls buttons; only this thread reads or changes it.
@@ -36,6 +41,10 @@ class ClientWindow(tk.Tk):
         self.username = tk.StringVar()
         # The validated server identity is present only after a successful join.
         self.user: dict | None = None
+        # None while disconnected or refreshing; only one directory poll may wait.
+        self._next_directory_poll: float | None = None
+        # Visible online count includes this user and excludes duplicate sessions.
+        self.directory_status = tk.StringVar(value="Online users (0)")
         # Status label updated by callbacks and _poll_events() on the main thread.
         self.status = tk.StringVar(value="Disconnected")
 
@@ -43,7 +52,7 @@ class ClientWindow(tk.Tk):
         frame = ttk.Frame(self, padding=16)
         frame.pack(fill="both", expand=True)
         frame.columnconfigure(1, weight=1)
-        frame.rowconfigure(5, weight=1)
+        frame.rowconfigure(4, weight=1)
 
         ttk.Label(frame, text="Server host").grid(row=0, column=0, sticky="w", padx=(0, 8))
         # Address input becomes read-only while its connection is in use.
@@ -73,10 +82,27 @@ class ClientWindow(tk.Tk):
         self.ping_button.pack(side="left")
 
         ttk.Label(frame, textvariable=self.status).grid(row=3, column=0, columnspan=4, sticky="w")
-        ttk.Label(frame, text="Activity").grid(row=4, column=0, columnspan=4, sticky="w", pady=(12, 4))
+        # Keep the online directory beside the expanding activity area.
+        content = ttk.Frame(frame)
+        content.grid(row=4, column=0, columnspan=4, sticky="nsew", pady=(12, 0))
+        content.columnconfigure(1, weight=1)
+        content.rowconfigure(1, weight=1)
+        ttk.Label(content, textvariable=self.directory_status).grid(row=0, column=0, sticky="w", pady=(0, 4))
+        ttk.Label(content, text="Activity").grid(row=0, column=1, sticky="w", pady=(0, 4))
+        # Native list/scrollbar controls keep large online lists keyboard-accessible.
+        people = ttk.Frame(content)
+        people.grid(row=1, column=0, sticky="nsew", padx=(0, 12))
+        # Stable item IDs preserve selection across full directory snapshots.
+        self.online_users = ttk.Treeview(people, show="tree", height=12, selectmode="browse")
+        self.online_users.column("#0", width=160, minwidth=120, stretch=False)
+        self.online_users.pack(side="left", fill="both", expand=True)
+        # Scroll only the online list, independently of activity output.
+        online_scroll = ttk.Scrollbar(people, orient="vertical", command=self.online_users.yview)
+        online_scroll.pack(side="right", fill="y")
+        self.online_users.configure(yscrollcommand=online_scroll.set)
         # Read-only output; _log() temporarily enables edits to append messages.
-        self.activity = ScrolledText(frame, width=72, height=12, wrap="word", state="disabled")
-        self.activity.grid(row=5, column=0, columnspan=4, sticky="nsew")
+        self.activity = ScrolledText(content, width=52, height=12, wrap="word", state="disabled")
+        self.activity.grid(row=1, column=1, sticky="nsew")
         self._set_state("disconnected")
         self.username_entry.focus_set()
         self.protocol("WM_DELETE_WINDOW", self.close)
@@ -166,9 +192,18 @@ class ClientWindow(tk.Tk):
                             self.user = value["data"]["user"]
                             self._set_state("connected")
                             self._log(f"Joined as {self.user['username']} (user #{self.user['id']}).")
+                            self._next_directory_poll = time.monotonic()
                         else:
                             self._log(f"{value['error']['code']}: {value['error']['message']}")
                             self.disconnect()
+                        continue
+                    if self._state == "refreshing":
+                        if value["ok"]:
+                            self._update_directory(value["data"]["online_users"])
+                        else:
+                            self._log(f"{value['error']['code']}: {value['error']['message']}")
+                        self._set_state("connected")
+                        self._next_directory_poll = time.monotonic() + DIRECTORY_POLL_INTERVAL
                         continue
                     if value["ok"]:
                         self._log(f"Response #{value['request_id']}: {value['data']}")
@@ -182,12 +217,45 @@ class ClientWindow(tk.Tk):
                 self.network.join()
                 self.network = None
                 self.user = None
+                self._next_directory_poll = None
+                self._update_directory([])
                 if self._closing:
                     self.destroy()
                     return
                 self._set_state("disconnected")
                 self._log("Disconnected.")
+        self._poll_directory()
         self._poll_id = self.after(50, self._poll_events)
+
+    # Poll immediately after login and then after each interval, only while idle.
+    # A ping already in flight takes precedence; missed polls are not accumulated.
+    # Reuse the network queue and existing Tk callback rather than another thread.
+    def _poll_directory(self) -> None:
+        if (self.network is not None and self._state == "connected"
+                and self._next_directory_poll is not None
+                and time.monotonic() >= self._next_directory_poll):
+            self._next_directory_poll = None
+            self._set_state("refreshing")
+            self.network.requests.put(("get_directory", {}))
+
+    # Apply a validated full snapshot on the main thread, marking this user's row.
+    # Reuse existing Treeview items to retain selection and remove offline users.
+    # The server has already sorted/deduplicated identities across connections.
+    def _update_directory(self, users: list[dict]) -> None:
+        removed = set(self.online_users.get_children())
+        for position, user in enumerate(users):
+            key = f"user-{user['id']}"
+            own = self.user is not None and user["id"] == self.user["id"]
+            text = user["username"] + (" (you)" if own else "")
+            if self.online_users.exists(key):
+                self.online_users.item(key, text=text)
+            else:
+                self.online_users.insert("", "end", iid=key, text=text)
+            self.online_users.move(key, "", position)
+            removed.discard(key)
+        for key in removed:
+            self.online_users.delete(key)
+        self.directory_status.set(f"Online users ({len(users)})")
 
     # Keep status text, button availability, and form editability in sync.
     # Only the disconnected state allows a new address or connection attempt.
@@ -196,11 +264,12 @@ class ClientWindow(tk.Tk):
         self._state = state
         self.status.set({
             "waiting": "Waiting for pong...", "joining": "Joining...",
+            "refreshing": "Refreshing online users...",
             "connected": f"Joined as {self.user['username']}" if self.user else "Connected",
         }.get(state, state.capitalize()))
         self.connect_button.configure(state="normal" if state == "disconnected" else "disabled")
         self.disconnect_button.configure(
-            state="normal" if state in {"connecting", "joining", "connected", "waiting"} else "disabled"
+            state="normal" if state in {"connecting", "joining", "connected", "waiting", "refreshing"} else "disabled"
         )
         self.ping_button.configure(state="normal" if state == "connected" else "disabled")
         entry_state = "normal" if state == "disconnected" else "readonly"

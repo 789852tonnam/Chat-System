@@ -59,6 +59,29 @@ class ClientNetworkTests(unittest.TestCase):
         client.requests.put(("login", {"username": "Bob"}))
         self.assertNotEqual(self.event(client, "response")["data"]["user"]["id"], alice["id"])
 
+    def test_directory_requires_join_and_returns_current_user(self):
+        client = self.client(self.server())
+        client.requests.put(("get_directory", {}))
+        self.assertEqual(self.event(client, "response")["error"]["code"], "UNAUTHENTICATED")
+        client.requests.put(("login", {"username": "Alice"}))
+        user = self.event(client, "response")["data"]["user"]
+        client.requests.put(("get_directory", {}))
+        self.assertEqual(self.event(client, "response")["data"], {"online_users": [user], "groups": []})
+
+    def test_invalid_directory_response_closes_connection(self):
+        class InvalidDirectoryServer(ChatServer):
+            def _send_response(self, connection, response):
+                if response["ok"] and "online_users" in response["data"]:
+                    response["data"]["online_users"] = [None]
+                return super()._send_response(connection, response)
+
+        client = self.client(self.server(InvalidDirectoryServer))
+        client.requests.put(("login", {"username": "Alice"}))
+        self.event(client, "response")
+        client.requests.put(("get_directory", {}))
+        self.assertIn("invalid user", self.event(client, "error"))
+        self.event(client, "disconnected")
+
     def test_invalid_login_user_response_closes_connection(self):
         for user in [None, {"id": True, "username": "Alice"},
                      {"id": 1, "username": "invalid name"}]:

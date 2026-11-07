@@ -1,5 +1,6 @@
 """Tkinter interaction tests; skip when a graphical display is unavailable."""
 
+import gc
 import threading
 import time
 import tkinter as tk
@@ -15,6 +16,12 @@ from server import ChatServer, ServerConfig
 class ClientUITests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        # Collect destroyed Tk windows on this thread before later network tests
+        # can trigger cyclic GC from a worker and run Tk finalizers off-thread.
+        if gc.isenabled():
+            cls.addClassCleanup(gc.enable)
+        gc.disable()
+        cls.addClassCleanup(gc.collect)
         try:
             root = tk.Tk()
         except tk.TclError as exc:
@@ -22,9 +29,9 @@ class ClientUITests(unittest.TestCase):
         root.withdraw()
         root.destroy()
 
-    def window(self, server=None):
+    def window(self, server=None, username="Alice"):
         window = ClientWindow(*(server.address if server else ("127.0.0.1", 5000)))
-        window.username.set("Alice")
+        window.username.set(username)
         window.withdraw()
         self.addCleanup(self.close_window, window)
         return window
@@ -76,7 +83,7 @@ class ClientUITests(unittest.TestCase):
             window.ping_button.invoke()
             self.assertTrue(window.ping_button.instate(["disabled"]))
             self.pump_until(window, lambda: window._state == "connected")
-            self.assertIn("Response #2: {'pong': True}", window.activity.get("1.0", "end"))
+            self.assertIn("{'pong': True}", window.activity.get("1.0", "end"))
             worker = window.network
             window.disconnect_button.invoke()
             self.pump_until(window, lambda: window.network is None)
@@ -147,6 +154,9 @@ class ClientUITests(unittest.TestCase):
             window.after(10, heartbeat.set)
             self.pump_until(window, heartbeat.is_set)
             self.assertEqual(window._state, "waiting")
+            window._next_directory_poll = time.monotonic() - 1
+            window._poll_directory()
+            self.assertTrue(window.network.requests.empty())
             worker = window.network
             window.close()
             self.pump_until(window, lambda: window.network is None)
@@ -164,3 +174,56 @@ class ClientUITests(unittest.TestCase):
             client.main()
         self.assertFalse(worker.is_alive())
         self.assertIsNone(window.network)
+
+    def test_directory_poll_updates_two_windows_and_preserves_selection(self):
+        with patch("client.DIRECTORY_POLL_INTERVAL", 0.05):
+            server = self.server()
+            alice = self.window(server)
+            bob = self.window(server, "Bob")
+            alice.connect()
+            self.pump_until(alice, lambda: len(alice.online_users.get_children()) == 1)
+            bob.connect()
+            self.pump_until(alice, lambda: len(alice.online_users.get_children()) == 2
+                            and len(bob.online_users.get_children()) == 2)
+            texts = [alice.online_users.item(key, "text") for key in alice.online_users.get_children()]
+            self.assertEqual(texts, ["Alice (you)", "Bob"])
+            self.assertEqual(alice.directory_status.get(), "Online users (2)")
+            selected = f"user-{bob.user['id']}"
+            alice.online_users.selection_set(selected)
+            alice._next_directory_poll = time.monotonic() - 1
+            self.pump_until(alice, lambda: alice._state == "refreshing")
+            self.pump_until(alice, lambda: alice._state == "connected")
+            self.assertEqual(alice.online_users.selection(), (selected,))
+            bob.disconnect()
+            self.pump_until(alice, lambda: bob.network is None and len(alice.online_users.get_children()) == 1)
+            self.assertEqual(bob.online_users.get_children(), ())
+            self.assertEqual(alice.online_users.item(alice.online_users.get_children()[0], "text"), "Alice (you)")
+
+    def test_slow_directory_does_not_stack_polls_or_block_window_close(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        class SlowDirectoryServer(ChatServer):
+            def _handle_request(self, request, session):
+                if request.action == "get_directory":
+                    entered.set()
+                    release.wait(3)
+                return super()._handle_request(request, session)
+
+        window = self.window(self.server(SlowDirectoryServer))
+        try:
+            window.connect()
+            self.pump_until(window, entered.is_set)
+            self.assertEqual(window._state, "refreshing")
+            self.assertTrue(window.ping_button.instate(["disabled"]))
+            window._next_directory_poll = time.monotonic() - 1
+            for _ in range(3):
+                window._poll_directory()
+            self.assertTrue(window.network.requests.empty())
+            heartbeat = threading.Event()
+            window.after(10, heartbeat.set)
+            self.pump_until(window, heartbeat.is_set)
+            window.close()
+            self.pump_until(window, lambda: window.network is None)
+        finally:
+            release.set()
