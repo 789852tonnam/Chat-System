@@ -1,78 +1,91 @@
 # Socket Chat
 
-โครงงาน Computer Network: แอปแชต Python/Tkinter เชื่อม Server ผ่าน TCP Socket มีแชตส่วนตัว กลุ่ม และฟีเจอร์พิเศษสี่รายการ
+A Computer Network term project using Python, Tkinter, and TCP sockets. The planned application includes private chats, group chats, and four additional features.
 
-**สถานะปัจจุบัน:** Server transport/ping ใช้งานได้แล้ว ผ่าน 29 tests รวม TCP loopback ยังไม่มีระบบบัญชี/แชต, Tkinter Client, SQL schema หรือ Docker image
+**Current status:** The server and Tkinter client support connection management and ping. All 44 tests passed, including real TCP loopback and Tkinter UI tests. Accounts, chat, the SQL schema, and Docker images are not implemented yet.
 
-## รัน Server ขั้นแรก
+## Run the server
 
-ใช้ Python 3.11 ขึ้นไปและไม่ต้องติดตั้ง package เพิ่ม จากโฟลเดอร์ socket-chat:
+Use Python 3.11 or later. The application uses the Python standard library and does not require additional pip packages. From the socket-chat directory:
 
 ```bash
 python3 server.py --host 127.0.0.1 --port 5000
 ```
 
-ดู [Server guide](docs/server.md) สำหรับการลอง ping, ใช้งาน LAN และคำอธิบาย Thread/Queue; กด Ctrl-C เพื่อปิด
+Press Ctrl-C to stop the server. For LAN connections, bind the server to `0.0.0.0` and allow access to its TCP port. See the local [Server guide](docs/server.md) for ping examples and the thread/queue flow.
+
+## Run the Tkinter client
+
+Open another terminal in the socket-chat directory:
+
+```bash
+python3 client.py --host 127.0.0.1 --port 5000
+```
+
+Select **Connect**, then **Send Ping**, and check Activity for the pong response. Select **Disconnect** to close the connection, or close the window to exit. Tkinter and a graphical display are required. When connecting from another computer, enter the server computer's LAN IP instead of `127.0.0.1`.
+
+`client.py` owns the UI. `client_network.py` owns the socket and network thread. Requests and results pass through queues: the network module never imports Tkinter, and the UI never performs socket I/O. Both client and server receive data with `recv()` and assemble complete JSON lines with `LineFramer`.
+
+This client slice does not poll automatically. If the server closes an idle connection, the client detects it on the next request. Reconnect explicitly with **Connect**. Requests are never retried automatically.
+
+See the local [Client guide](docs/client.md) for details. The `docs/`, `diagram/`, and `GLOSSARY.md` paths are ignored by Git and exist only in the development workspace; they are not included in a Git checkout.
+
+## Run tests
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
 
-## เริ่มอ่านที่นี่
+GUI tests skip when no display is available. TCP tests require permission to open localhost sockets. Unicode fixtures use escape sequences in source files while still exercising multibyte UTF-8 data at runtime.
 
-| เอกสาร | ใช้ทำอะไร |
+## Local documentation
+
+The links in the following tables refer to ignored files available in the development workspace.
+
+| Document | Purpose |
 | --- | --- |
-| [Requirement และเกณฑ์รับงาน](docs/requirements.md) | ตรวจ R1–R11, คะแนน, หลักฐานที่ต้องสาธิตและสิ่งที่ต้องส่ง |
-| [ภาพรวมการออกแบบ](docs/design.md) | ดูข้อสรุปล่าสุดและหน้าที่ของแต่ละส่วน |
-| [แผนลงมือทำ](docs/implementation-plan.md) | ทำทีละช่วง ตั้งแต่เชื่อมต่อจนสาธิตสองเครื่อง |
-| [ประเด็นที่ยังไม่ตกลง](docs/open-decisions.md) | แยกข้อเสนอและรายละเอียดเปิดออกจากการตัดสินใจแล้ว |
-| [Server ที่ implement แล้ว](docs/server.md) | รัน ตรวจ ping และอ่าน flow ในโค้ด |
-| [คำศัพท์](GLOSSARY.md) | ใช้คำเรียกบัญชี ห้อง สมาชิก และหมุดให้ตรงกัน |
+| [Requirements and acceptance criteria](docs/requirements.md) | R1-R11, grading, demonstration evidence, and submission materials |
+| [Design overview](docs/design.md) | Agreed behavior and component responsibilities |
+| [Implementation plan](docs/implementation-plan.md) | Milestones from connectivity to the two-computer demonstration |
+| [Open decisions](docs/open-decisions.md) | Proposals and unresolved details, separate from confirmed decisions |
+| [Implemented server](docs/server.md) | Running the server, testing ping, and understanding its execution flow |
+| [Glossary](GLOSSARY.md) | Shared terminology for accounts, rooms, memberships, and pins |
 
-## รายละเอียดและแผนภาพ
+## Detailed references and diagrams
 
-| หัวข้อ | เอกสาร | PlantUML |
+| Topic | Documentation | PlantUML |
 | --- | --- | --- |
-| Thread, Queue และหน้าที่ Client/Server | [Design](docs/design.md) | [Architecture](diagram/architecture.puml) |
-| โครงสร้างข้อมูล | [Data model](docs/data-model.md) | [Database](diagram/database.puml) |
-| TCP request/response | [Protocol](docs/protocol.md) | — |
-| Contract ทุกคำสั่งและตัวอย่าง JSON | [API reference](docs/api-reference.md), [Examples](docs/protocol-examples.json) | — |
-| Poll, ประวัติ และ revision | [Synchronization](docs/synchronization.md) | — |
-| AI, หัวใจ, หมุด, ข้อความวิ่ง | [Special features](docs/special-features.md) | — |
-| OpenRouter และโมเดลฟรี | [AI](docs/ai.md) | — |
-| LAN, Docker และข้อมูลถาวร | [Deployment](docs/deployment.md) | [Deployment](diagram/deployment.puml) |
-| ไฟล์โจทย์ เทมเพลต และประกาศส่งงาน | [References](docs/references/README.md) | — |
+| Client/server threads, queues, and responsibilities | [Design](docs/design.md) | [Architecture](diagram/architecture.puml) |
+| Data structures | [Data model](docs/data-model.md) | [Database](diagram/database.puml) |
+| TCP request/response | [Protocol](docs/protocol.md) | - |
+| Action contracts and JSON examples | [API reference](docs/api-reference.md), [Examples](docs/protocol-examples.json) | - |
+| Polling, history, and revisions | [Synchronization](docs/synchronization.md) | - |
+| AI, hearts, pins, and a room-wide rimshot sound button | [Special features](docs/special-features.md) | - |
+| OpenRouter and free models | [AI](docs/ai.md) | - |
+| LAN, Docker, and persistent data | [Deployment](docs/deployment.md) | [Deployment](diagram/deployment.puml) |
+| Assignment, template, and submission instructions | [References](docs/references/README.md) | - |
 
-## โครงสร้างปัจจุบัน
+## Current project structure
 
 ```text
 socket-chat/
-├── README.md
-├── GLOSSARY.md
-├── server.py                # Runnable transport/ping server
-├── common/
-│   └── protocol.py          # Shared wire-format helpers
-├── tests/                   # Unit + loopback TCP integration
-├── diagram/                 # Editable PlantUML sources
-└── docs/
-    ├── design.md
-    ├── server.md
-    ├── requirements.md
-    ├── implementation-plan.md
-    ├── open-decisions.md
-    ├── data-model.md
-    ├── protocol.md
-    ├── api-reference.md
-    ├── protocol-examples.json
-    ├── synchronization.md
-    ├── special-features.md
-    ├── ai.md
-    ├── deployment.md
-    └── references/          # Source documents, unchanged copies
+|-- .gitignore
+|-- README.md
+|-- server.py                # Runnable transport/ping server
+|-- client.py                # Tkinter UI and main-thread event handling
+|-- client_network.py        # Socket worker and request/result queues
+|-- common/
+|   |-- __init__.py
+|   `-- protocol.py          # Shared wire-format helpers
+`-- tests/                   # Protocol, TCP, and Tkinter interaction tests
+    |-- test_client_network.py
+    |-- test_client_ui.py
+    |-- test_protocol.py
+    `-- test_server.py
 ```
 
-Server อยู่ใน server.py ส่วน Client จะเป็นคนละไฟล์ตามโจทย์ โค้ดปัจจุบันตอบจริงเฉพาะ ping และ error ของ transport; คำสั่งแอปที่ยังไม่ทำตอบ ACTION_NOT_IMPLEMENTED ไม่มีการอ้างว่า API v1.0 implement ครบแล้ว
+The server and client are separate files as required by the assignment. The current server implements only ping and transport error responses. Known application actions without handlers return `ACTION_NOT_IMPLEMENTED`; this is not a complete implementation of Protocol v1.0.
 
-เอกสารใช้สถานะ **ยืนยันแล้ว**, **ข้อเสนอ**, **ยังไม่ตกลง** แยกกัน การยืนยันการออกแบบไม่ใช่หลักฐานว่า implement หรือผ่านการทดสอบแล้ว
+Local documentation distinguishes **confirmed**, **proposed**, and **unresolved** decisions. Confirming a design does not prove that it has been implemented or tested.
 
-Protocol v1.0 และสัญญา action กำหนดโดยผู้ช่วยตามคำขอให้ตัดสินใจและจดเป็นมาตรฐานกลาง รายละเอียดที่เหลือนอก API เช่น database engine, วิธีเก็บรหัสผ่าน และ AI model selector ยังอยู่ใน Open decisions
+Protocol v1.0 and the action contracts were specified by the assistant at the user's request as a shared API standard. Decisions outside that contract, such as the database engine, password storage, and AI model selector, remain in Open decisions.

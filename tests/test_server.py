@@ -74,8 +74,8 @@ class ServerTests(unittest.TestCase):
 
     def test_fragmented_utf8_frame_and_next_request(self):
         peer = self.peer(self.start())
-        wire = encode_message({"request_id": 1, "action": "ทดสอบ", "payload": {}})
-        split = wire.index("ท".encode()) + 1
+        wire = encode_message({"request_id": 1, "action": "\u0e17\u0e14\u0e2a\u0e2d\u0e1a", "payload": {}})
+        split = wire.index("\u0e17".encode()) + 1
         peer.socket.sendall(wire[:split])
         peer.socket.sendall(wire[split:])
         self.assertEqual(peer.read()["error"]["code"], "UNKNOWN_ACTION")

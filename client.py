@@ -1,0 +1,220 @@
+"""Tkinter connection/ping client; socket I/O lives in client_network.py."""
+
+from __future__ import annotations
+
+import argparse
+import queue
+import tkinter as tk
+from tkinter import ttk
+from tkinter.scrolledtext import ScrolledText
+
+from client_network import NetworkClient
+
+
+class ClientWindow(tk.Tk):
+    """Update widgets only on Tkinter's main thread."""
+
+    # Run on the main thread to create the window, connection form, and log.
+    # Construction schedules queue polling but does not open a TCP connection.
+    # Button callbacks enqueue work; only this thread reads or changes widgets.
+    def __init__(self, host: str = "127.0.0.1", port: int = 5000):
+        super().__init__()
+        self.title("Socket Chat - Connection")
+        self.minsize(640, 360)
+        # A new worker is created for each explicit connection attempt.
+        self.network: NetworkClient | None = None
+        # UI state controls buttons; only this thread reads or changes it.
+        self._state = "disconnected"
+        # Prevent new connections while close() waits for the worker to exit.
+        self._closing = False
+        # Editable server address; connect() passes a plain string to the worker.
+        self.host = tk.StringVar(value=host)
+        # Port stays text until connect() validates and converts it to an integer.
+        self.port = tk.StringVar(value=str(port))
+        # Status label updated by callbacks and _poll_events() on the main thread.
+        self.status = tk.StringVar(value="Disconnected")
+
+        # Main container; the host field and log expand when the window grows.
+        frame = ttk.Frame(self, padding=16)
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(1, weight=1)
+        frame.rowconfigure(4, weight=1)
+
+        ttk.Label(frame, text="Server host").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        # Address input becomes read-only while its connection is in use.
+        self.host_entry = ttk.Entry(frame, textvariable=self.host)
+        self.host_entry.grid(row=0, column=1, sticky="ew")
+        ttk.Label(frame, text="Port").grid(row=0, column=2, padx=(16, 8))
+        # Port input is kept separate so validation can focus the incorrect field.
+        self.port_entry = ttk.Entry(frame, textvariable=self.port, width=8)
+        self.port_entry.grid(row=0, column=3, sticky="ew")
+
+        # Keep connection controls together and separate from the expanding log.
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=1, column=0, columnspan=4, sticky="w", pady=12)
+        # Starts a new worker only when the previous connection has ended.
+        self.connect_button = ttk.Button(buttons, text="Connect", command=self.connect)
+        self.connect_button.pack(side="left")
+        # Cancels the worker while leaving the window available for reconnecting.
+        self.disconnect_button = ttk.Button(buttons, text="Disconnect", command=self.disconnect)
+        self.disconnect_button.pack(side="left", padx=8)
+        # Enabled only when connected and no request is awaiting its response.
+        self.ping_button = ttk.Button(buttons, text="Send Ping", command=self.ping)
+        self.ping_button.pack(side="left")
+
+        ttk.Label(frame, textvariable=self.status).grid(row=2, column=0, columnspan=4, sticky="w")
+        ttk.Label(frame, text="Activity").grid(row=3, column=0, columnspan=4, sticky="w", pady=(12, 4))
+        # Read-only output; _log() temporarily enables edits to append messages.
+        self.activity = ScrolledText(frame, width=72, height=12, wrap="word", state="disabled")
+        self.activity.grid(row=4, column=0, columnspan=4, sticky="nsew")
+        self._set_state("disconnected")
+        self.host_entry.focus_set()
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        # Tk callback ID lets close() cancel a pending poll before destroying UI.
+        self._poll_id: str | None = self.after(50, self._poll_events)
+
+    # Called by Connect on the main thread; reject an empty host or invalid port.
+    # Copy form values into a new worker, then return without waiting for TCP.
+    # An existing worker must finish before another connection can be started.
+    def connect(self) -> None:
+        if self.network is not None or self._closing:
+            return
+        host = self.host.get().strip()
+        try:
+            port = int(self.port.get())
+            if not host or not 1 <= port <= 65535:
+                raise ValueError
+        except ValueError:
+            self.status.set("Enter a server host and a port between 1 and 65535.")
+            self._log("Invalid server address.")
+            (self.host_entry if not host else self.port_entry).focus_set()
+            return
+        self.network = NetworkClient(host, port)
+        self._set_state("connecting")
+        self._log(f"Connecting to {host}:{port}...")
+        self.network.start()
+
+    # Called by Send Ping; enqueue the action and an empty payload for the worker.
+    # Mark the UI as waiting so repeated clicks cannot queue duplicate pings.
+    # _poll_events() restores the connected state when a response arrives.
+    def ping(self) -> None:
+        if self.network is None or self._state != "connected":
+            return
+        self._set_state("waiting")
+        self._log("Sending ping...")
+        self.network.requests.put(("ping", {}))
+
+    # Signal the current worker to stop without closing its socket from the UI.
+    # Leave the event loop running; _poll_events() notices when cleanup finishes.
+    # Reconnecting is enabled only after the previous worker has exited.
+    def disconnect(self) -> None:
+        if self.network is not None:
+            self._set_state("disconnecting")
+            self.network.stop()
+
+    # Handle window close on the main thread and prevent further connections.
+    # If no worker remains, cancel the pending poll and destroy the window now.
+    # Otherwise signal cancellation; _poll_events() destroys it after worker exit.
+    def close(self) -> None:
+        self._closing = True
+        if self.network is None:
+            if self._poll_id is not None:
+                self.after_cancel(self._poll_id)
+            self.destroy()
+        else:
+            self._set_state("closing")
+            self.network.stop()
+
+    # Run every 50 ms on the Tkinter thread and drain events without waiting.
+    # Apply responses/errors to widgets; the worker never calls Tkinter itself.
+    # Check thread completion before draining so its final events are not lost.
+    # Join only an exited worker, then allow reconnecting or finish window close.
+    def _poll_events(self) -> None:
+        self._poll_id = None
+        if self.network is not None:
+            finished = not self.network.is_alive()
+            while True:
+                try:
+                    kind, value = self.network.events.get_nowait()
+                except queue.Empty:
+                    break
+                if kind == "connected":
+                    self._log("Connected.")
+                    if self._state == "connecting":
+                        self._set_state("connected")
+                elif kind == "response":
+                    if value["ok"]:
+                        self._log(f"Response #{value['request_id']}: {value['data']}")
+                    else:
+                        self._log(f"{value['error']['code']}: {value['error']['message']}")
+                    if self._state == "waiting":
+                        self._set_state("connected")
+                elif kind == "error":
+                    self._log(f"Network error: {value}")
+            if finished:
+                self.network.join()
+                self.network = None
+                if self._closing:
+                    self.destroy()
+                    return
+                self._set_state("disconnected")
+                self._log("Disconnected.")
+        self._poll_id = self.after(50, self._poll_events)
+
+    # Keep status text, button availability, and form editability in sync.
+    # Only the disconnected state allows a new address or connection attempt.
+    # Waiting disables Ping while Disconnect remains available for cancellation.
+    def _set_state(self, state: str) -> None:
+        self._state = state
+        self.status.set({"waiting": "Waiting for pong..."}.get(state, state.capitalize()))
+        self.connect_button.configure(state="normal" if state == "disconnected" else "disabled")
+        self.disconnect_button.configure(
+            state="normal" if state in {"connecting", "connected", "waiting"} else "disabled"
+        )
+        self.ping_button.configure(state="normal" if state == "connected" else "disabled")
+        entry_state = "normal" if state == "disconnected" else "readonly"
+        self.host_entry.configure(state=entry_state)
+        self.port_entry.configure(state=entry_state)
+
+    # Append activity on the main thread, then restore the read-only widget state.
+    # Limit each entry and retained line count so the log cannot grow indefinitely.
+    # Scroll to the newest entry while still allowing text selection and copying.
+    def _log(self, message: str) -> None:
+        self.activity.configure(state="normal")
+        self.activity.insert("end", message[:2000] + "\n")
+        line_count = int(self.activity.index("end-1c").split(".")[0])
+        if line_count > 200:
+            self.activity.delete("1.0", f"{line_count - 199}.0")
+        self.activity.see("end")
+        self.activity.configure(state="disabled")
+
+
+# Parse the initial server address and run Tkinter on the process's main thread.
+# Report display startup errors through argparse instead of starting a worker.
+# On terminal interruption or normal exit, stop/join any worker before cleanup.
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=5000)
+    args = parser.parse_args()
+    try:
+        window = ClientWindow(args.host, args.port)
+    except tk.TclError as exc:
+        parser.exit(1, f"Cannot open client window: {exc}\n")
+    try:
+        window.mainloop()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if window.network is not None:
+            window.network.stop()
+            window.network.join()
+            window.network = None
+        try:
+            window.close()
+        except tk.TclError:
+            pass
+
+
+if __name__ == "__main__":
+    main()

@@ -12,12 +12,13 @@ from common.protocol import (
     encode_message,
     read_request_id,
     validate_envelope,
+    validate_response,
 )
 
 
 class FramingTests(unittest.TestCase):
     def test_utf8_can_be_split_inside_a_character(self):
-        document = {"request_id": 1, "action": "ping", "payload": {"text": "ไทย\nบรรทัดสอง"}}
+        document = {"request_id": 1, "action": "ping", "payload": {"text": "\u0e44\u0e17\u0e22\n\u0e1a\u0e23\u0e23\u0e17\u0e31\u0e14\u0e2a\u0e2d\u0e07"}}
         wire = encode_message(document)
         framer = LineFramer()
         frames = []
@@ -36,7 +37,7 @@ class FramingTests(unittest.TestCase):
 
     def test_limit_counts_bytes_and_cr_but_not_lf(self):
         self.assertEqual(list(LineFramer(3).feed(b"ab\r\n")), [b"ab"])
-        for wire in [b"abc\r\n", b"abcd", b"abcd\n", "ไทย".encode()]:
+        for wire in [b"abc\r\n", b"abcd", b"abcd\n", "\u0e44\u0e17\u0e22".encode()]:
             with self.subTest(wire=wire), self.assertRaises(FrameTooLarge):
                 list(LineFramer(3).feed(wire))
 
@@ -47,12 +48,12 @@ class FramingTests(unittest.TestCase):
             next(frames)
 
     def test_encoder_escapes_newlines_and_keeps_unicode(self):
-        wire = encode_message({"text": "ไทย\nสอง"})
+        wire = encode_message({"text": "\u0e44\u0e17\u0e22\n\u0e2a\u0e2d\u0e07"})
         self.assertEqual(wire.count(b"\n"), 1)
-        self.assertIn("ไทย".encode(), wire)
-        self.assertEqual(json.loads(wire), {"text": "ไทย\nสอง"})
+        self.assertIn("\u0e44\u0e17\u0e22".encode(), wire)
+        self.assertEqual(json.loads(wire), {"text": "\u0e44\u0e17\u0e22\n\u0e2a\u0e2d\u0e07"})
         with self.assertRaises(FrameTooLarge):
-            encode_message({"text": "ไทย"}, max_bytes=3)
+            encode_message({"text": "\u0e44\u0e17\u0e22"}, max_bytes=3)
 
 
 class RequestValidationTests(unittest.TestCase):
@@ -97,3 +98,33 @@ class RequestValidationTests(unittest.TestCase):
             self.assertEqual(caught.exception.code, "INVALID_REQUEST")
         request = validate_envelope(base, 1)
         self.assertEqual((request.request_id, request.action, request.payload), (1, "ping", {}))
+
+
+class ResponseValidationTests(unittest.TestCase):
+    def test_success_error_and_additional_response_fields(self):
+        for response in [
+            {"request_id": 1, "ok": True, "data": {}, "extra": 1},
+            {"request_id": 1, "ok": False, "error": {
+                "code": "SERVER_BUSY", "message": "Try again", "details": {},
+            }},
+        ]:
+            self.assertIs(validate_response(response, 1), response)
+
+    def test_invalid_response_fields_and_mismatched_ids(self):
+        valid = {"request_id": 1, "ok": True, "data": {}}
+        for response in [
+            {}, {**valid, "request_id": True}, {**valid, "request_id": 2},
+            {**valid, "request_id": None}, {**valid, "ok": 1},
+            {**valid, "data": []}, {**valid, "error": {}},
+            {"request_id": 1, "ok": False},
+            {"request_id": 1, "ok": False, "error": {"code": "BAD"}},
+            {"request_id": 1, "ok": False, "error": {"code": 1, "message": "Bad"}},
+            {"request_id": 1, "ok": False, "error": {
+                "code": "BAD", "message": "Bad", "details": [],
+            }},
+            {"request_id": 1, "ok": False, "error": {
+                "code": "BAD", "message": "Bad",
+            }, "data": {}},
+        ]:
+            with self.subTest(response=response), self.assertRaises(ProtocolError):
+                validate_response(response, 1)

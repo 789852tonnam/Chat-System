@@ -8,10 +8,14 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
 
+# Maximum request frame size before LF; an optional CR counts toward this limit.
 MAX_REQUEST_BYTES = 65_536
+# Larger reply limit allows bounded batches of history and directory information.
 MAX_RESPONSE_BYTES = 4_194_304
+# IDs stay within the integer range that JSON clients can represent exactly.
 MAX_REQUEST_ID = 9_007_199_254_740_991
 
+# Distinguish unknown actions from known actions whose handlers are not built yet.
 KNOWN_ACTIONS = frozenset(
     {
         "ping", "register", "login", "logout", "get_directory",
@@ -29,17 +33,27 @@ class FrameTooLarge(ValueError):
 class ProtocolError(Exception):
     """A recoverable request error, unless the connection is explicitly fatal."""
 
+    # Carry a machine-readable error code and a safe message for the response.
+    # close marks request errors that require ending the offending connection.
+    # The base exception also receives the message so str(error) remains useful.
     def __init__(self, code: str, message: str, *, close: bool = False):
         super().__init__(message)
+        # Stable code used by callers to identify the kind of protocol failure.
         self.code = code
+        # Human-readable explanation used by error_response() or the client log.
         self.message = message
+        # Server I/O closes the connection after replying when this flag is True.
         self.close = close
 
 
+# Frozen request envelope passed from a server I/O thread to its worker.
 @dataclass(frozen=True, slots=True)
 class Request:
+    # Correlates a response with this request within its original TCP connection.
     request_id: int
+    # Names the handler; action-specific payload validation happens afterward.
     action: str
+    # Parsed action arguments; validating the envelope does not validate contents.
     payload: dict[str, Any]
 
 
@@ -50,14 +64,27 @@ class LineFramer:
     recv must still be processed before the fatal error is reported.
     """
 
+    # Prepare an empty byte buffer and a per-frame limit without reading a socket.
+    # Each connection needs its own framer so different byte streams never mix.
+    # Clients pass MAX_RESPONSE_BYTES; the default is the server's request limit.
     def __init__(self, max_bytes: int = MAX_REQUEST_BYTES):
+        # Accumulates incoming chunks and retains an unfinished line between calls.
         self._buffer = bytearray()
+        # Maximum bytes before LF, checked before an optional CR is removed.
         self._max_bytes = max_bytes
 
+    # Report whether bytes remain after the last emitted frame, without clearing.
+    # The server uses this to track partial-frame timing; the client also checks
+    # for unexpected data remaining after its one outstanding response.
     @property
     def has_pending(self) -> bool:
         return bool(self._buffer)
 
+    # Consume a received chunk and yield complete frames without their CR/LF.
+    # Remove each completed line but retain an incomplete tail for the next call.
+    # Work happens during iteration: a valid earlier frame is yielded before a
+    # later oversized frame raises FrameTooLarge, preserving response order.
+    # Keep bytes undecoded here because a UTF-8 character may span two chunks.
     def feed(self, chunk: bytes) -> Iterator[bytes]:
         self._buffer.extend(chunk)
         while True:
@@ -75,6 +102,9 @@ class LineFramer:
             yield frame
 
 
+# JSON object_pairs_hook receives key/value pairs before building a dictionary.
+# Reject repeated keys here, including nested ones, instead of silently keeping
+# the last value and losing evidence that the input was ambiguous.
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result = {}
     for key, value in pairs:
@@ -84,10 +114,16 @@ def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+# JSON parse_constant hook rejects NaN and Infinity accepted by Python's parser.
+# These values are outside our JSON contract; raising ValueError lets
+# decode_document() turn the parser failure into a recoverable INVALID_JSON.
 def _reject_constant(value: str) -> None:
     raise ValueError("Non-finite JSON constant")
 
 
+# JSON parse_float hook also catches numeric overflow such as 1e999 becoming inf.
+# parse_constant alone cannot catch this because the input is a numeric literal.
+# Return only finite floats; decode_document() translates failures to INVALID_JSON.
 def _finite_float(value: str) -> float:
     number = float(value)
     if not math.isfinite(number):
@@ -95,6 +131,10 @@ def _finite_float(value: str) -> float:
     return number
 
 
+# Decode one complete frame as UTF-8, then parse a strict JSON object.
+# Invalid UTF-8 is fatal; malformed JSON and non-object roots are protocol errors.
+# This function does not inspect request/response fields; callers validate those
+# next and decide whether to reply, log the error, or close their connection.
 def decode_document(frame: bytes) -> dict[str, Any]:
     try:
         text = frame.decode("utf-8")
@@ -114,6 +154,9 @@ def decode_document(frame: bytes) -> dict[str, Any]:
     return document
 
 
+# Extract a positive integer ID while rejecting bool and out-of-range values.
+# The server calls this before envelope validation so a usable ID can be echoed
+# and reserved even when other fields in the same request turn out to be invalid.
 def read_request_id(document: dict[str, Any]) -> int:
     request_id = document.get("request_id")
     # bool is a subclass of int in Python, but is not an ID in this protocol.
@@ -122,6 +165,10 @@ def read_request_id(document: dict[str, Any]) -> int:
     return request_id
 
 
+# Validate the exact outer request fields and the types of action and payload.
+# request_id has already passed read_request_id() and connection sequence checks.
+# Return a Request for the worker; this does not validate an action's arguments,
+# authenticate the caller, or check room permissions.
 def validate_envelope(document: dict[str, Any], request_id: int) -> Request:
     if set(document) != {"request_id", "action", "payload"}:
         raise ProtocolError("INVALID_REQUEST", "Request must contain exactly request_id, action, and payload")
@@ -130,10 +177,43 @@ def validate_envelope(document: dict[str, Any], request_id: int) -> Request:
     return Request(request_id, document["action"], document["payload"])
 
 
+# Validate a parsed response against the client's one outstanding request ID.
+# Require boolean ok and the matching success/error fields, while allowing
+# additional response fields for compatibility with the protocol contract.
+# Return the original dictionary; callers display or process its data afterward.
+def validate_response(document: dict[str, Any], request_id: int) -> dict[str, Any]:
+    """Check required response fields and match the one outstanding request."""
+    if type(document.get("request_id")) is not int or document["request_id"] != request_id:
+        raise ProtocolError("INVALID_RESPONSE", "Response request_id does not match the request")
+    if type(document.get("ok")) is not bool:
+        raise ProtocolError("INVALID_RESPONSE", "Response ok must be a boolean")
+    if document["ok"]:
+        if type(document.get("data")) is not dict or "error" in document:
+            raise ProtocolError("INVALID_RESPONSE", "Successful response must contain data and no error")
+    else:
+        error = document.get("error")
+        if (
+            type(error) is not dict
+            or type(error.get("code")) is not str
+            or type(error.get("message")) is not str
+            or ("details" in error and type(error["details"]) is not dict)
+            or "data" in document
+        ):
+            raise ProtocolError("INVALID_RESPONSE", "Failed response must contain a valid error and no data")
+    return document
+
+
+# Build the standard successful response envelope using the original request ID.
+# The handler supplies its action-specific data; serialization happens later,
+# so this helper neither writes to a socket nor changes application state.
 def success_response(request_id: int, data: dict[str, Any]) -> dict[str, Any]:
     return {"request_id": request_id, "ok": True, "data": data}
 
 
+# Build the standard failure envelope from a safe code/message supplied by caller.
+# request_id may be None when malformed input did not contain a usable ID.
+# Return a dictionary only; the connection owner decides how to send it and
+# whether the connection must close after the error.
 def error_response(
     request_id: int | None, code: str, message: str
 ) -> dict[str, Any]:
@@ -144,6 +224,10 @@ def error_response(
     }
 
 
+# Serialize an envelope as compact UTF-8 JSON and append exactly one LF delimiter.
+# The JSON encoder escapes newlines inside strings and rejects non-finite values.
+# Enforce the byte limit before adding LF; raise FrameTooLarge before any socket
+# write so callers can reject the request or replace an oversized response.
 def encode_message(
     message: dict[str, Any], *, max_bytes: int = MAX_RESPONSE_BYTES
 ) -> bytes:
