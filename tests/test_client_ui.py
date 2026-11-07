@@ -413,3 +413,82 @@ class ClientUITests(unittest.TestCase):
         window.join_group_button.invoke()
         self.pump_until(window, lambda: len(window.logic.messages) == 20 and window.logic.state == "connected")
         self.assertNotIn("Private only", window.chat.get("1.0", "end"))
+
+    def test_two_windows_share_hearts_and_allow_any_member_to_replace_or_remove_pin(self):
+        with patch("client_logic.DIRECTORY_POLL_INTERVAL", 0.3), patch("client_logic.ROOM_POLL_INTERVAL", 0.15):
+            server = self.server()
+            raw_alice, raw_bob = self.raw_peer(server, "Alice"), self.raw_peer(server, "Bob")
+            key = raw_alice.ok("open_private", {"target_user_id": raw_bob.user["id"]})["room"]["room_key"]
+            first, second = [raw_alice.ok("send_message", {"room_key": key, "content": text})["message"]["id"]
+                             for text in ("First", "Second")]
+            alice, bob = self.window(server), self.window(server, "Bob")
+            alice.connect()
+            bob.connect()
+            self.open_room(alice, raw_bob.user["id"])
+            self.open_room(bob, raw_alice.user["id"])
+            # Enter selects the message under the read-only text cursor.
+            alice.chat.mark_set("insert", alice.chat.tag_ranges(f"message-{first}")[0])
+            alice._select_at_cursor()
+            self.pump_until(alice, lambda: not alice.heart_button.instate(["disabled"]))
+            alice.heart_button.invoke()
+            self.pump_until(alice, lambda: alice.logic.messages[first]["hearted_by_me"]
+                            and bob.logic.messages[first]["heart_count"] == 1)
+            self.assertFalse(bob.logic.messages[first]["hearted_by_me"])
+            self.assertEqual(alice.heart_button.cget("text"), "Unheart")
+            bob._select_message(second)
+            self.pump_until(bob, lambda: not bob.pin_button.instate(["disabled"]))
+            bob.pin_button.invoke()
+            self.pump_until(alice, lambda: alice.logic.pinned_message is not None and bob.logic.pinned_message is not None
+                            and alice.logic.pinned_message["id"] == second and bob.logic.pinned_message["id"] == second)
+            self.assertIn("Second", alice.pin_text.get("1.0", "end"))
+            alice._select_message(first)
+            self.pump_until(alice, lambda: not alice.pin_button.instate(["disabled"]))
+            alice.pin_button.invoke()
+            self.pump_until(bob, lambda: bob.logic.pinned_message["id"] == first and alice.logic.pinned_message["id"] == first)
+            self.pump_until(bob, lambda: not bob.unpin_button.instate(["disabled"]))
+            bob.unpin_button.invoke()
+            self.pump_until(alice, lambda: alice.logic.pinned_message is None and bob.logic.pinned_message is None)
+            self.assertEqual(alice.pin_frame.winfo_manager(), "")
+            self.pump_until(alice, lambda: not alice.heart_button.instate(["disabled"]))
+            alice.heart_button.invoke()
+            self.pump_until(alice, lambda: alice.logic.messages[first]["heart_count"] == 0
+                            and bob.logic.messages[first]["heart_count"] == 0)
+            self.assertEqual(len(alice.logic.messages), 2)
+            self.assertEqual(alice._selected_message_id, first)
+
+    def test_snapshot_preserves_loaded_history_scroll_and_pin_outside_initial_page(self):
+        server = self.server()
+        raw_alice, raw_bob = self.raw_peer(server, "Alice"), self.raw_peer(server, "Bob")
+        key = raw_alice.ok("open_private", {"target_user_id": raw_bob.user["id"]})["room"]["room_key"]
+        ids = [raw_alice.ok("send_message", {"room_key": key, "content": f"History {i}"})["message"]["id"] for i in range(145)]
+        raw_bob.ok("set_pin", {"room_key": key, "message_id": ids[0]})
+        window = self.window(server)
+        window.deiconify()
+        window.geometry("880x600")
+        window.connect()
+        self.open_room(window, raw_bob.user["id"])
+        self.assertNotIn(ids[0], window.logic.messages)
+        self.assertIn("History 0", window.pin_text.get("1.0", "end"))
+        while window.logic.has_more_older:
+            self.pump_until(window, lambda: not window.older_button.instate(["disabled"]))
+            previous = len(window.logic.messages)
+            window.older_button.invoke()
+            self.pump_until(window, lambda: len(window.logic.messages) > previous and window.logic.state == "connected")
+        self.assertEqual(len(window.logic.messages), 145)
+        window.logic._next_room_poll = time.monotonic() + 60
+        window.chat.yview("50.0")
+        window.update_idletasks()
+        anchor = window.chat.index("@0,0")
+        raw_bob.ok("set_heart", {"room_key": key, "message_id": ids[30], "hearted": True})
+        raw_bob.ok("set_pin", {"room_key": key, "message_id": ids[1]})
+        window.logic._next_room_poll = time.monotonic()
+        self.pump_until(window, lambda: window.logic.room_revision == 3 and window.logic._snapshot is None)
+        window.update_idletasks()
+        self.assertEqual(window.chat.index("@0,0"), anchor)
+        self.assertEqual(set(window.logic.messages), set(ids))
+        self.assertEqual(window.logic.pinned_message["id"], ids[1])
+        self.assertEqual(window.logic.messages[ids[30]]["heart_count"], 1)
+        self.assertFalse(window.logic.messages[ids[30]]["hearted_by_me"])
+        for widget in (window.pin_frame, window.unpin_button, window.heart_button, window.pin_button, window.send_button):
+            bottom = widget.winfo_rooty() - window.winfo_rooty() + widget.winfo_height()
+            self.assertLessEqual(bottom, window.winfo_height())

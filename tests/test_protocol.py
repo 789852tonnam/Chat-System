@@ -262,3 +262,67 @@ class ChatValidationTests(unittest.TestCase):
         bad["new_messages"][0]["content"] = "\ud800"
         with self.assertRaises(ProtocolError):
             validate_sync_response(bad, request)
+
+
+class SnapshotValidationTests(unittest.TestCase):
+    def setUp(self):
+        self.request = {"room_key": "private:1:2", "from_id": 4, "through_id": 12,
+                        "after_id": None, "room_revision": 3, "limit": 2}
+        self.message = {"id": 4, "room_key": "private:1:2", "sender_kind": "human",
+                        "sender": {"id": 1, "username": "Alice"}, "content": "Hello", "created_at": "now",
+                        "heart_count": 1, "hearted_by_me": True, "ai": None}
+        self.page = {"room_key": "private:1:2", "room_revision": 3,
+                     "messages": [self.message, {**self.message, "id": 8}],
+                     "pinned_message": {**self.message, "id": 1}, "has_more": True, "next_after_id": 8}
+
+    def test_snapshot_request_accepts_fixed_or_null_ranges_only(self):
+        from common.protocol import validate_snapshot_request
+        validate_snapshot_request(self.request)
+        validate_snapshot_request({**self.request, "from_id": None, "through_id": None})
+        for change in [{"from_id": None}, {"through_id": 3}, {"after_id": True}, {"after_id": 13},
+                       {"room_revision": -1}, {"limit": True}, {"limit": 101}, {"extra": 1}]:
+            with self.subTest(change=change), self.assertRaises(ProtocolError):
+                validate_snapshot_request({**self.request, **change})
+
+    def test_snapshot_response_checks_revision_range_and_progress(self):
+        from common.protocol import validate_snapshot_response
+        validate_snapshot_response(self.page, self.request)
+        for change in [{"room_revision": 2}, {"room_revision": True}, {"next_after_id": 4},
+                       {"has_more": 1}, {"messages": [self.message]},
+                       {"messages": [{**self.message, "id": 3}, {**self.message, "id": 8}]},
+                       {"messages": [{**self.message, "id": 8}, {**self.message, "id": 8}]},
+                       {"pinned_message": {**self.message, "room_key": "private:1:3"}}]:
+            with self.subTest(change=change), self.assertRaises(ProtocolError):
+                validate_snapshot_response({**self.page, **change}, self.request)
+        empty = {**self.page, "messages": [], "has_more": False, "next_after_id": None}
+        validate_snapshot_response(empty, {**self.request, "from_id": None, "through_id": None})
+        with self.assertRaises(ProtocolError):
+            validate_snapshot_response({**self.page, "has_more": False}, self.request)
+
+    def test_heart_and_pin_acknowledgements_match_desired_state(self):
+        from common.protocol import validate_mutation_response, validate_message
+        request = {"room_key": "private:1:2", "message_id": 4, "hearted": True}
+        data = {**request, "heart_count": 1, "hearted_by_me": True, "room_revision": 3}
+        validate_mutation_response(data, request, "set_heart")
+        for change in [{"message_id": True}, {"message_id": 5}, {"heart_count": -1},
+                       {"heart_count": True}, {"heart_count": 0}, {"hearted_by_me": False}]:
+            with self.subTest(change=change), self.assertRaises(ProtocolError):
+                validate_mutation_response({**data, **change}, request, "set_heart")
+        validate_message(self.message, request["room_key"])
+        with self.assertRaises(ProtocolError):
+            validate_message({**self.message, "hearted_by_me": 1}, request["room_key"])
+        pin = {"room_key": request["room_key"], "pinned_message": self.message, "room_revision": 3}
+        validate_mutation_response(pin, request, "set_pin")
+        with self.assertRaises(ProtocolError):
+            validate_mutation_response(pin, {**request, "message_id": None}, "set_pin")
+
+    def test_sync_reload_flag_must_match_revision_without_advancing_cursors(self):
+        request = {"room_key": "private:1:2", "old_count": 0, "oldest_id": 4, "latest_id": 12, "room_revision": 2}
+        data = {"room_key": "private:1:2", "older_messages": [], "new_messages": [],
+                "oldest_id": 4, "latest_id": 12, "has_more_older": False, "has_more_new": False,
+                "reload_required": True, "room_revision": 3, "pinned_message": self.message,
+                "effect_revision": 0, "effect": None}
+        validate_sync_response(data, request)
+        for change in [{"reload_required": False}, {"room_revision": 2}, {"latest_id": 13}]:
+            with self.assertRaises(ProtocolError):
+                validate_sync_response({**data, **change}, request)

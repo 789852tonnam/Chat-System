@@ -38,7 +38,7 @@ class ProtocolError(Exception):
     # Carry a machine-readable error code and a safe message for the response.
     # close marks request errors that require ending the offending connection.
     # The base exception also receives the message so str(error) remains useful.
-    def __init__(self, code: str, message: str, *, close: bool = False):
+    def __init__(self, code: str, message: str, *, close: bool = False, details: dict | None = None):
         super().__init__(message)
         # Stable code used by callers to identify the kind of protocol failure.
         self.code = code
@@ -46,6 +46,8 @@ class ProtocolError(Exception):
         self.message = message
         # Server I/O closes the connection after replying when this flag is True.
         self.close = close
+        # Structured recovery information, such as the current snapshot revision.
+        self.details = details
 
 
 # Frozen request envelope passed from a server I/O thread to its worker.
@@ -255,6 +257,30 @@ def validate_sync_request(payload: dict[str, Any]) -> None:
         raise ProtocolError("INVALID_PAYLOAD", "Invalid history cursor combination")
 
 
+# Validate a bounded inclusive snapshot range without allowing mixed null bounds.
+# Later pages continue strictly after a delivered ID inside that same range.
+def validate_snapshot_request(payload: dict[str, Any]) -> None:
+    required = {"room_key", "from_id", "through_id", "after_id", "room_revision"}
+    if not required <= payload.keys() or payload.keys() - required - {"limit"}:
+        raise ProtocolError("INVALID_PAYLOAD", "Invalid snapshot fields")
+    validate_room_key(payload["room_key"])
+    validate_id(payload["room_revision"], "room_revision", zero=True)
+    limit = payload.get("limit", 100)
+    if type(limit) is not int or not 1 <= limit <= 100:
+        raise ProtocolError("INVALID_PAYLOAD", "Snapshot limit must be between 1 and 100")
+    first, last, after = payload["from_id"], payload["through_id"], payload["after_id"]
+    if first is None and last is None and after is None:
+        return
+    validate_id(first, "from_id")
+    validate_id(last, "through_id")
+    if first > last:
+        raise ProtocolError("INVALID_PAYLOAD", "Snapshot bounds must be increasing")
+    if after is not None:
+        validate_id(after, "after_id")
+        if not first <= after <= last:
+            raise ProtocolError("INVALID_PAYLOAD", "Snapshot cursor must be inside its range")
+
+
 # Validate the public user fields returned by login and directory responses.
 # Share this check so both actions reject invalid IDs and display names before
 # the UI receives them; additional user fields may be ignored by older clients.
@@ -321,7 +347,7 @@ def validate_room(room: Any) -> dict[str, Any]:
 
 
 # Validate the human-message format implemented by the current chat milestone.
-# Hearts, pins and AI are not implemented yet, so their empty values are explicit.
+# Heart state is viewer-specific; AI fields retain their empty state for now.
 def validate_message(message: Any, room_key: str) -> dict[str, Any]:
     if (type(message) is not dict or not {"id", "room_key", "sender_kind", "sender", "content", "created_at",
                                         "heart_count", "hearted_by_me", "ai"} <= message.keys()
@@ -332,10 +358,70 @@ def validate_message(message: Any, room_key: str) -> dict[str, Any]:
     if validate_content(message.get("content")) != message["content"]:
         raise ProtocolError("INVALID_RESPONSE", "Message content must already use normalized newlines")
     if (message.get("sender_kind") != "human" or type(message.get("created_at")) is not str
-            or type(message.get("heart_count")) is not int or message["heart_count"] != 0
-            or message.get("hearted_by_me") is not False or message.get("ai") is not None):
+            or message.get("ai") is not None):
         raise ProtocolError("INVALID_RESPONSE", "Invalid message fields")
+    _validate_heart_fields(message)
     return message
+
+
+# A viewer-owned heart must contribute to the non-negative total count.
+def _validate_heart_fields(data: dict) -> None:
+    if (type(data.get("heart_count")) is not int or data["heart_count"] < 0
+            or type(data.get("hearted_by_me")) is not bool
+            or (data["hearted_by_me"] and data["heart_count"] == 0)):
+        raise ProtocolError("INVALID_RESPONSE", "Invalid heart state")
+
+
+# Pins can be outside the visible history, but must still belong to this room.
+def _validate_pin(data: dict, room_key: str) -> None:
+    if "pinned_message" not in data:
+        raise ProtocolError("INVALID_RESPONSE", "Missing pinned_message")
+    if data["pinned_message"] is not None:
+        validate_message(data["pinned_message"], room_key)
+
+
+# Match desired-state acknowledgements to the exact room/message request.
+# These revisions confirm a mutation, not that the client has reloaded its range.
+def validate_mutation_response(data: dict, request: dict, action: str) -> None:
+    if data.get("room_key") != request["room_key"]:
+        raise ProtocolError("INVALID_RESPONSE", "Mutation belongs to an unexpected room")
+    validate_id(data.get("room_revision"), "room_revision", zero=True)
+    if action == "set_heart":
+        validate_id(data.get("message_id"), "message_id")
+        _validate_heart_fields(data)
+        if data["message_id"] != request["message_id"] or data["hearted_by_me"] != request["hearted"]:
+            raise ProtocolError("INVALID_RESPONSE", "Heart acknowledgement does not match its request")
+    else:
+        _validate_pin(data, request["room_key"])
+        pinned = data["pinned_message"]
+        if (None if pinned is None else pinned["id"]) != request["message_id"]:
+            raise ProtocolError("INVALID_RESPONSE", "Pin acknowledgement does not match its request")
+
+
+# Check the fixed range, revision and pagination cursor before staging a page.
+def validate_snapshot_response(data: dict, request: dict) -> None:
+    if data.get("room_key") != request["room_key"]:
+        raise ProtocolError("INVALID_RESPONSE", "Snapshot belongs to an unexpected room")
+    validate_id(data.get("room_revision"), "room_revision", zero=True)
+    if data["room_revision"] != request["room_revision"] or type(data.get("has_more")) is not bool:
+        raise ProtocolError("INVALID_RESPONSE", "Snapshot revision or continuation is invalid")
+    _validate_pin(data, request["room_key"])
+    values = data.get("messages")
+    limit = request.get("limit", 100)
+    if type(values) is not list or len(values) > limit or "next_after_id" not in data:
+        raise ProtocolError("INVALID_RESPONSE", "Invalid snapshot batch")
+    ids = [validate_message(message, request["room_key"])["id"] for message in values]
+    if ids != sorted(set(ids)):
+        raise ProtocolError("INVALID_RESPONSE", "Snapshot IDs must be unique and increasing")
+    first, last, after = request["from_id"], request["through_id"], request["after_id"]
+    if ids and (first is None or ids[0] < first or ids[-1] > last or (after is not None and ids[0] <= after)):
+        raise ProtocolError("INVALID_RESPONSE", "Snapshot messages are outside the requested range")
+    if data["has_more"]:
+        validate_id(data["next_after_id"], "next_after_id")
+        if len(ids) != limit or data["next_after_id"] != ids[-1] or ids[-1] >= last:
+            raise ProtocolError("INVALID_RESPONSE", "Snapshot continuation must advance within its range")
+    elif data["next_after_id"] is not None:
+        raise ProtocolError("INVALID_RESPONSE", "Completed snapshot must not have a next cursor")
 
 
 # Check room ownership, ordered patches and returned cursors before UI application.
@@ -353,8 +439,12 @@ def validate_sync_response(data: dict[str, Any], request: dict[str, Any]) -> Non
     if data["oldest_id"] is not None:
         validate_id(data["oldest_id"], "oldest_id")
     validate_id(data["latest_id"], "latest_id", zero=True)
-    if data.get("pinned_message") is not None or data.get("effect") is not None or data["effect_revision"] != 0:
-        raise ProtocolError("INVALID_RESPONSE", "This client build does not support pin or sound state yet")
+    _validate_pin(data, request["room_key"])
+    if data.get("effect") is not None or data["effect_revision"] != 0:
+        raise ProtocolError("INVALID_RESPONSE", "This client build does not support sound state yet")
+    expected_reload = request["room_revision"] is not None and request["room_revision"] != data["room_revision"]
+    if data["reload_required"] != expected_reload:
+        raise ProtocolError("INVALID_RESPONSE", "Reload flag does not match the requested revision")
     arrays = []
     for key, limit in (("older_messages", request["old_count"]), ("new_messages", 100)):
         values = data.get(key)
@@ -424,13 +514,16 @@ def success_response(request_id: int, data: dict[str, Any]) -> dict[str, Any]:
 # Return a dictionary only; the connection owner decides how to send it and
 # whether the connection must close after the error.
 def error_response(
-    request_id: int | None, code: str, message: str
+    request_id: int | None, code: str, message: str, *, details: dict | None = None
 ) -> dict[str, Any]:
-    return {
+    response = {
         "request_id": request_id,
         "ok": False,
         "error": {"code": code, "message": message},
     }
+    if details is not None:
+        response["error"]["details"] = details
+    return response
 
 
 # Serialize an envelope as compact UTF-8 JSON and append exactly one LF delimiter.

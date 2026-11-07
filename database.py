@@ -34,6 +34,7 @@ def open_database(path: str) -> sqlite3.Connection:
                     name TEXT,
                     created_by INTEGER NOT NULL REFERENCES users(id),
                     room_revision INTEGER NOT NULL DEFAULT 0,
+                    pinned_message_id INTEGER REFERENCES messages(id),
                     created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS room_members (
@@ -52,7 +53,17 @@ def open_database(path: str) -> sqlite3.Connection:
                         REFERENCES room_members(room_key, user_id)
                 );
                 CREATE INDEX IF NOT EXISTS messages_room_id ON messages(room_key, id);
+                CREATE TABLE IF NOT EXISTS message_hearts (
+                    message_id INTEGER NOT NULL REFERENCES messages(id),
+                    user_id INTEGER NOT NULL REFERENCES users(id),
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(message_id, user_id)
+                );
             """)
+            # Older files keep their users, rooms and messages during this upgrade.
+            columns = {row["name"] for row in connection.execute("PRAGMA table_info(rooms)")}
+            if "pinned_message_id" not in columns:
+                connection.execute("ALTER TABLE rooms ADD COLUMN pinned_message_id INTEGER REFERENCES messages(id)")
     except Exception:
         connection.close()
         raise
@@ -176,19 +187,102 @@ def join_group(connection: sqlite3.Connection, user_id: int, room_key: str) -> d
 # Read bounded message rows with sender names, using only fixed SQL fragments
 # supplied by this module; values always use parameters rather than formatting.
 def _messages(connection: sqlite3.Connection, room_key: str, boundary: str,
-              parameters: tuple, *, descending: bool = False, limit: int = 100) -> list[dict]:
+              parameters: tuple, *, user_id: int, descending: bool = False, limit: int = 100) -> list[dict]:
     order = "DESC" if descending else "ASC"
     rows = connection.execute(
-        "SELECT m.*, u.username FROM messages m JOIN users u ON u.id = m.sender_user_id "
+        "SELECT m.*, u.username, "
+        "(SELECT COUNT(*) FROM message_hearts h WHERE h.message_id = m.id) AS heart_count, "
+        "EXISTS(SELECT 1 FROM message_hearts h WHERE h.message_id = m.id AND h.user_id = ?) AS hearted_by_me "
+        "FROM messages m JOIN users u ON u.id = m.sender_user_id "
         f"WHERE m.room_key = ? {boundary} ORDER BY m.id {order} LIMIT ?",
-        (room_key, *parameters, limit),
+        (user_id, room_key, *parameters, limit),
     ).fetchall()
     if descending:
         rows.reverse()
     return [{"id": row["id"], "room_key": row["room_key"], "sender_kind": "human",
              "sender": {"id": row["sender_user_id"], "username": row["username"]},
              "content": row["content"], "created_at": row["created_at"],
-             "heart_count": 0, "hearted_by_me": False, "ai": None} for row in rows]
+             "heart_count": row["heart_count"], "hearted_by_me": bool(row["hearted_by_me"]), "ai": None} for row in rows]
+
+
+# Resolve a message after room authorization, distinguishing missing/wrong-room IDs.
+def _require_message(connection: sqlite3.Connection, room_key: str, message_id: int) -> None:
+    message = connection.execute("SELECT room_key FROM messages WHERE id = ?", (message_id,)).fetchone()
+    if message is None:
+        raise ProtocolError("MESSAGE_NOT_FOUND", "Message not found")
+    if message["room_key"] != room_key:
+        raise ProtocolError("MESSAGE_NOT_IN_ROOM", "Message belongs to another room")
+
+
+# Include the pinned message even when it is outside the client's loaded range.
+# Heart ownership is always calculated for the requesting account.
+def _pinned_message(connection: sqlite3.Connection, room: sqlite3.Row, user_id: int) -> dict | None:
+    if room["pinned_message_id"] is None:
+        return None
+    return _messages(connection, room["room_key"], "AND m.id = ?", (room["pinned_message_id"],), user_id=user_id, limit=1)[0]
+
+
+# Set the desired account/message heart state; repeated requests are no-ops.
+# Commit the state and its room revision together, without counting devices twice.
+def set_heart(connection: sqlite3.Connection, room_key: str, user_id: int, message_id: int, hearted: bool) -> dict:
+    room = require_room(connection, room_key, user_id)
+    _require_message(connection, room_key, message_id)
+    with connection:
+        if hearted:
+            changed = connection.execute(
+                "INSERT INTO message_hearts VALUES (?, ?, ?) ON CONFLICT(message_id, user_id) DO NOTHING",
+                (message_id, user_id, _timestamp()),
+            ).rowcount
+        else:
+            changed = connection.execute(
+                "DELETE FROM message_hearts WHERE message_id = ? AND user_id = ?", (message_id, user_id),
+            ).rowcount
+        if changed:
+            connection.execute("UPDATE rooms SET room_revision = room_revision + 1 WHERE room_key = ?", (room_key,))
+    message = _messages(connection, room_key, "AND m.id = ?", (message_id,), user_id=user_id, limit=1)[0]
+    return {"room_key": room_key, "message_id": message_id, "heart_count": message["heart_count"],
+            "hearted_by_me": message["hearted_by_me"], "room_revision": room["room_revision"] + changed}
+
+
+# Replace or clear the room's single pin after checking membership and ownership.
+# The creator has no special role; only a real change advances the revision.
+def set_pin(connection: sqlite3.Connection, room_key: str, user_id: int, message_id: int | None) -> dict:
+    room = require_room(connection, room_key, user_id)
+    if message_id is not None:
+        _require_message(connection, room_key, message_id)
+    changed = room["pinned_message_id"] != message_id
+    if changed:
+        with connection:
+            connection.execute(
+                "UPDATE rooms SET pinned_message_id = ?, room_revision = room_revision + 1 WHERE room_key = ?",
+                (message_id, room_key),
+            )
+    room = connection.execute("SELECT * FROM rooms WHERE room_key = ?", (room_key,)).fetchone()
+    return {"room_key": room_key, "pinned_message": _pinned_message(connection, room, user_id),
+            "room_revision": room["room_revision"]}
+
+
+# Read one fixed-range page at the requested revision; do not include newer chat.
+# The single worker serializes reads and mutations, so each page and pin agree.
+def get_room_snapshot(connection: sqlite3.Connection, user_id: int, payload: dict) -> dict:
+    room = require_room(connection, payload["room_key"], user_id)
+    if room["room_revision"] != payload["room_revision"]:
+        raise ProtocolError("SNAPSHOT_STALE", "Room changed while reloading",
+                            details={"room_revision": room["room_revision"]})
+    messages = []
+    limit = payload.get("limit", 100)
+    if payload["from_id"] is not None:
+        boundary = "AND m.id >= ? AND m.id <= ?"
+        parameters = (payload["from_id"], payload["through_id"])
+        if payload["after_id"] is not None:
+            boundary += " AND m.id > ?"
+            parameters += (payload["after_id"],)
+        messages = _messages(connection, room["room_key"], boundary, parameters, user_id=user_id, limit=limit + 1)
+    has_more = len(messages) > limit
+    messages = messages[:limit]
+    return {"room_key": room["room_key"], "messages": messages,
+            "pinned_message": _pinned_message(connection, room, user_id), "room_revision": room["room_revision"],
+            "next_after_id": messages[-1]["id"] if has_more else None, "has_more": has_more}
 
 
 # Persist a validated human message before returning its acknowledgement.
@@ -200,12 +294,12 @@ def send_message(connection: sqlite3.Connection, room_key: str, user_id: int, co
             "INSERT INTO messages (room_key, sender_user_id, content, created_at) VALUES (?, ?, ?, ?)",
             (room_key, user_id, content, _timestamp()),
         ).lastrowid
-    return {"message": _messages(connection, room_key, "AND m.id = ?", (message_id,), limit=1)[0]}
+    return {"message": _messages(connection, room_key, "AND m.id = ?", (message_id,), user_id=user_id, limit=1)[0]}
 
 
 # Return initial history or bounded older/newer patches for the active room.
 # Global IDs may have gaps: query by room and inequalities, never subtract IDs.
-# Revision/pin/effect fields retain their empty state until those features exist.
+# Revision changes require a separate snapshot; patches never advance during reload.
 def sync_room(connection: sqlite3.Connection, user_id: int, payload: dict) -> dict:
     room_key = payload["room_key"]
     room = require_room(connection, room_key, user_id)
@@ -215,13 +309,13 @@ def sync_room(connection: sqlite3.Connection, user_id: int, payload: dict) -> di
     older, newer = [], []
     if not reload_required:
         if latest is None:
-            older = _messages(connection, room_key, "", (), descending=True, limit=payload["old_count"])
+            older = _messages(connection, room_key, "", (), user_id=user_id, descending=True, limit=payload["old_count"])
             oldest, latest = (older[0]["id"], older[-1]["id"]) if older else (None, 0)
         else:
             if oldest is not None and payload["old_count"]:
                 older = _messages(connection, room_key, "AND m.id < ?", (oldest,),
-                                  descending=True, limit=payload["old_count"])
-            newer = _messages(connection, room_key, "AND m.id > ?", (latest,))
+                                  user_id=user_id, descending=True, limit=payload["old_count"])
+            newer = _messages(connection, room_key, "AND m.id > ?", (latest,), user_id=user_id)
             if older:
                 oldest = older[0]["id"]
             if newer:
@@ -236,4 +330,4 @@ def sync_room(connection: sqlite3.Connection, user_id: int, payload: dict) -> di
     return {"room_key": room_key, "older_messages": older, "new_messages": newer,
             "oldest_id": oldest, "latest_id": latest, "has_more_older": has_older,
             "has_more_new": has_new, "room_revision": revision, "reload_required": reload_required,
-            "pinned_message": None, "effect_revision": 0, "effect": None}
+            "pinned_message": _pinned_message(connection, room, user_id), "effect_revision": 0, "effect": None}

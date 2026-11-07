@@ -36,6 +36,10 @@ class ClientWindow(tk.Tk):
         self.group_name = tk.StringVar()
         # Updated from room-title events; room metadata belongs to logic.
         self.room_title = tk.StringVar(value="Select an online user and open a chat")
+        # Selection is presentation state; message/reaction data belongs to logic.
+        self._selected_message_id: int | None = None
+        # Explains which message the Heart/Pin buttons will act on.
+        self.selection_title = tk.StringVar(value="Click a message to select")
         # Updated by _render_state() or a form validation error.
         self.status = tk.StringVar(value="Disconnected")
 
@@ -125,7 +129,7 @@ class ClientWindow(tk.Tk):
         conversation = ttk.Frame(content)
         conversation.grid(row=1, column=1, sticky="nsew")
         conversation.columnconfigure(0, weight=1)
-        conversation.rowconfigure(1, weight=1)
+        conversation.rowconfigure(2, weight=1)
         # Keep the room name and older-history control above the chat view.
         header = ttk.Frame(conversation)
         header.grid(row=0, column=0, sticky="ew", pady=(0, 4))
@@ -133,12 +137,31 @@ class ClientWindow(tk.Tk):
         # Ask for the nearest twenty messages before the current oldest cursor.
         self.older_button = ttk.Button(header, text="Load older (20)", command=self.load_older)
         self.older_button.pack(side="right")
+        # One room-wide pin stays above history, including pins outside its range.
+        self.pin_frame = ttk.Frame(conversation, padding=4, relief="solid")
+        self.pin_frame.grid(row=1, column=0, sticky="ew", pady=(0, 4))
+        self.pin_frame.columnconfigure(0, weight=1)
+        self.pin_text = ScrolledText(self.pin_frame, width=40, height=2, wrap="word", state="disabled")
+        self.pin_text.grid(row=0, column=0, sticky="ew")
+        self.unpin_button = ttk.Button(self.pin_frame, text="Unpin", command=lambda: self.logic.set_pin(None))
+        self.unpin_button.grid(row=0, column=1, padx=(6, 0))
+        self.pin_frame.grid_remove()
         # Only sync responses populate this chronological chat view.
         self.chat = ScrolledText(conversation, width=52, height=12, wrap="word", state="disabled")
-        self.chat.grid(row=1, column=0, sticky="nsew")
+        self.chat.grid(row=2, column=0, sticky="nsew")
+        self.chat.tag_configure("selected_message", background="#e3efff")
+        self.chat.bind("<Return>", self._select_at_cursor)
+        # Native buttons also support keyboard activation after selecting a message.
+        message_actions = ttk.Frame(conversation)
+        message_actions.grid(row=3, column=0, sticky="ew", pady=(4, 0))
+        self.heart_button = ttk.Button(message_actions, text="Heart", command=self._heart_selected)
+        self.heart_button.pack(side="left")
+        self.pin_button = ttk.Button(message_actions, text="Pin message", command=self._pin_selected)
+        self.pin_button.pack(side="left", padx=6)
+        ttk.Label(message_actions, textvariable=self.selection_title, wraplength=260).pack(side="left")
         # Message input remains separate from read-only history and diagnostic logs.
         composer = ttk.Frame(conversation)
-        composer.grid(row=2, column=0, sticky="ew", pady=8)
+        composer.grid(row=4, column=0, sticky="ew", pady=8)
         composer.columnconfigure(0, weight=1)
         # Multiline input is retained on errors and locked until a send is confirmed.
         self.message_input = tk.Text(composer, height=3, wrap="word")
@@ -146,10 +169,10 @@ class ClientWindow(tk.Tk):
         self.message_input.bind("<Control-Return>", lambda event: (self.send(), "break")[1])
         self.send_button = ttk.Button(composer, text="Send", command=self.send)
         self.send_button.grid(row=0, column=1, padx=(8, 0))
-        ttk.Label(conversation, text="Activity").grid(row=3, column=0, sticky="w")
+        ttk.Label(conversation, text="Activity").grid(row=5, column=0, sticky="w")
         # Read-only output; _log() temporarily enables edits to append messages.
         self.activity = ScrolledText(conversation, width=52, height=5, wrap="word", state="disabled")
-        self.activity.grid(row=4, column=0, sticky="ew")
+        self.activity.grid(row=6, column=0, sticky="ew")
         self._render_state()
         self.username_entry.focus_set()
         self.protocol("WM_DELETE_WINDOW", self.close)
@@ -190,6 +213,45 @@ class ClientWindow(tk.Tk):
     def load_older(self) -> None:
         self.logic.load_older()
 
+    # Pass the selected message ID; logic derives the desired account heart state.
+    def _heart_selected(self) -> None:
+        if self._selected_message_id is not None:
+            self.logic.toggle_heart(self._selected_message_id)
+
+    # Pin the selected message without requiring the sender or creator's role.
+    def _pin_selected(self) -> None:
+        if self._selected_message_id is not None:
+            self.logic.set_pin(self._selected_message_id)
+
+    # Allow Enter at the text cursor to select the same message as a mouse click.
+    def _select_at_cursor(self, event=None) -> str:
+        for tag in self.chat.tag_names("insert"):
+            if tag.startswith("message-"):
+                self._select_message(int(tag.removeprefix("message-")))
+                break
+        return "break"
+
+    # Keep selection across redraws using message IDs, without retaining old rooms.
+    def _select_message(self, message_id: int | None) -> None:
+        self._selected_message_id = message_id if message_id in self.logic.messages else None
+        self.chat.tag_remove("selected_message", "1.0", "end")
+        if self._selected_message_id is not None:
+            self.chat.tag_add("selected_message", *self.chat.tag_ranges(f"message-{self._selected_message_id}"))
+            self.chat.tag_raise("sel")
+        self._update_message_controls()
+
+    # Render selection text and action availability from the current logic state.
+    # Busy requests cannot stack mutations, but the text remains selectable/copyable.
+    def _update_message_controls(self) -> None:
+        message = self.logic.messages.get(self._selected_message_id)
+        enabled = message is not None and self.logic.state == "connected"
+        self.heart_button.configure(state="normal" if enabled else "disabled",
+                                    text="Unheart" if message and message["hearted_by_me"] else "Heart")
+        self.pin_button.configure(state="normal" if enabled else "disabled")
+        self.unpin_button.configure(state="normal" if self.logic.pinned_message is not None and self.logic.state == "connected" else "disabled")
+        self.selection_title.set(f"Selected: {message['sender']['username']}: {message['content'][:35].replace(chr(10), ' ')}"
+                                 if message else "Click a message to select")
+
     # Request cancellation while leaving Tkinter free to show cleanup progress.
     def disconnect(self) -> None:
         self.logic.disconnect()
@@ -224,6 +286,8 @@ class ClientWindow(tk.Tk):
             self.message_input.delete("1.0", "end")
         elif kind == "group_created":
             self.group_name.set("")
+        elif kind == "pin":
+            self._render_pin()
         elif kind == "closed":
             if self._poll_id is not None:
                 self.after_cancel(self._poll_id)
@@ -231,12 +295,38 @@ class ClientWindow(tk.Tk):
 
     # Clear presentation for the previous room; logic has already dropped its cache.
     def _clear_room(self) -> None:
+        self._selected_message_id = None
         self.room_title.set("Select an online user and open a chat")
         self.chat.configure(state="normal")
         self.chat.delete("1.0", "end")
         self.chat.configure(state="disabled")
         self.message_input.configure(state="normal")
         self.message_input.delete("1.0", "end")
+        for tag in self.chat.tag_names():
+            if tag.startswith("message-"):
+                self.chat.tag_delete(tag)
+        self._render_pin()
+        self._update_message_controls()
+
+    # Show the full pinned text in a bounded, scrollable banner above the chat.
+    # A layout change keeps the visible history anchor or the bottom position.
+    def _render_pin(self) -> None:
+        pinned = self.logic.pinned_message
+        text = f"Pinned - {pinned['sender']['username']}: {pinned['content']}" if pinned else ""
+        if self.pin_text.get("1.0", "end-1c") == text:
+            return
+        top = self.chat.index("@0,0")
+        at_bottom = self.chat.yview()[1] >= 0.999
+        self.pin_text.configure(state="normal")
+        self.pin_text.delete("1.0", "end")
+        self.pin_text.insert("1.0", text)
+        self.pin_text.configure(state="disabled")
+        if pinned:
+            self.pin_frame.grid()
+        else:
+            self.pin_frame.grid_remove()
+        self.update_idletasks()
+        self.chat.see("end") if at_bottom else self.chat.yview(top)
 
     # Draw the merged history while retaining the user's visible text anchor.
     # Logic supplies newly prepended messages and whether history existed before.
@@ -247,8 +337,16 @@ class ClientWindow(tk.Tk):
         prepend_lines = sum(f"{message['sender']['username']}: {message['content']}\n".count("\n") for message in older)
         self.chat.configure(state="normal")
         self.chat.delete("1.0", "end")
+        for tag in self.chat.tag_names():
+            if tag.startswith("message-"):
+                self.chat.tag_delete(tag)
         for message in sorted(self.logic.messages.values(), key=lambda item: item["id"]):
-            self.chat.insert("end", f"{message['sender']['username']}: {message['content']}\n")
+            start = self.chat.index("end-1c")
+            heart = "\u2665" if message["hearted_by_me"] else "\u2661"
+            self.chat.insert("end", f"{message['sender']['username']}: {message['content']}  [{heart} {message['heart_count']}]\n")
+            tag = f"message-{message['id']}"
+            self.chat.tag_add(tag, start, "end-1c")
+            self.chat.tag_bind(tag, "<Button-1>", lambda event, message_id=message["id"]: self._select_message(message_id))
         if had_messages and older:
             self.chat.yview(f"{top_line + prepend_lines}.{top_column}")
         elif at_bottom:
@@ -256,6 +354,7 @@ class ClientWindow(tk.Tk):
         else:
             self.chat.yview(f"{top_line}.{top_column}")
         self.chat.configure(state="disabled")
+        self._select_message(self._selected_message_id)
 
     # Tick logic every 50 ms without blocking the Tkinter main loop.
     # A close event ends scheduling after the network worker has finished.
@@ -326,6 +425,7 @@ class ClientWindow(tk.Tk):
             "opening": "Opening conversation...", "syncing": "Loading messages...",
             "creating": "Creating group...",
             "sending": "Sending message...",
+            "updating": "Updating message...", "reloading": "Refreshing room state...",
             "connected": f"Joined as {self.logic.user['username']}" if self.logic.user else "Connected",
         }.get(state, state.capitalize()))
         self.connect_button.configure(state="normal" if state == "disconnected" else "disabled")
@@ -346,6 +446,7 @@ class ClientWindow(tk.Tk):
         self.host_entry.configure(state=entry_state)
         self.port_entry.configure(state=entry_state)
         self.username_entry.configure(state=entry_state)
+        self._update_message_controls()
 
     # Append activity on the main thread, then restore the read-only widget state.
     # Limit each entry and retained line count so the log cannot grow indefinitely.

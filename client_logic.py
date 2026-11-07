@@ -22,8 +22,8 @@ class ClientLogic:
 
     The owner calls actions and poll(), reads state, and handles synchronous
     events: state, log, input_error, directory, room_cleared, room_title,
-    messages (new older messages, previous-history flag), sent, group_created
-    and closed. A directory event carries the full online-user/group snapshot.
+    messages (new older messages, previous-history flag), sent, group_created,
+    pin and closed. A directory event carries the full online-user/group snapshot.
     Only NetworkClient performs socket I/O on its existing worker thread.
     """
 
@@ -63,8 +63,14 @@ class ClientLogic:
         self.oldest_id: int | None = None
         # Latest delivered history ID, including own messages after sync only.
         self.latest_id: int | None = None
-        # Applied revision; special-feature snapshot reload remains unimplemented.
+        # Revision shared by every displayed message's heart state and the pin.
         self.room_revision: int | None = None
+        # May reference a message older than the loaded history range.
+        self.pinned_message: dict | None = None
+        # Staged pages stay separate until the entire range has one revision.
+        self._snapshot: dict | None = None
+        # After two stale pages, defer another attempt to the next normal poll.
+        self._snapshot_stales = 0
         # Controls whether an older-history action can request another batch.
         self.has_more_older = False
         # Active-room poll deadline; None while a room sync is pending.
@@ -172,6 +178,22 @@ class ClientLogic:
         if self.room is not None and self.state == "connected" and self.has_more_older:
             self._sync_room(20)
 
+    # Derive the desired account heart state from the selected cached message.
+    # Acknowledgement schedules sync; it never advances the cached room revision.
+    def toggle_heart(self, message_id: int) -> None:
+        message = self.messages.get(message_id)
+        if self.room is None or self.state != "connected" or message is None:
+            return
+        self._request("set_heart", {"room_key": self.room["room_key"], "message_id": message_id,
+                                    "hearted": not message["hearted_by_me"]}, "updating")
+
+    # Pin a displayed message or clear the current banner using a null ID.
+    # Every member can replace/remove a pin, regardless of who set it.
+    def set_pin(self, message_id: int | None) -> None:
+        if self.room is None or self.state != "connected" or (message_id is not None and message_id not in self.messages):
+            return
+        self._request("set_pin", {"room_key": self.room["room_key"], "message_id": message_id}, "updating")
+
     # Include both history bounds; an initial open uses null cursors and twenty.
     def _sync_room(self, old_count: int) -> None:
         self._next_room_poll = None
@@ -187,6 +209,9 @@ class ClientLogic:
         self.room = None
         self.messages.clear()
         self.oldest_id = self.latest_id = self.room_revision = None
+        self.pinned_message = None
+        self._snapshot = None
+        self._snapshot_stales = 0
         self.has_more_older = False
         self._next_room_poll = None
         self._emit("room_cleared", None)
@@ -195,8 +220,11 @@ class ClientLogic:
     # Tell the view which older messages were added so it can retain its scroll anchor.
     def _apply_room_sync(self, data: dict) -> None:
         if data["reload_required"]:
-            self._emit("log", "Room state changed; reopen this chat. Revision reload is not implemented yet.")
-            self._clear_room()
+            self._snapshot = {"from_id": self.oldest_id,
+                              "through_id": self.latest_id if self.oldest_id is not None else None,
+                              "after_id": None, "room_revision": data["room_revision"], "messages": {}}
+            self._snapshot_stales = 0
+            self._next_room_poll = None
             return
         older = [message for message in data["older_messages"] if message["id"] not in self.messages]
         had_messages = bool(self.messages)
@@ -204,10 +232,35 @@ class ClientLogic:
             self.messages[message["id"]] = message
         self.oldest_id, self.latest_id = data["oldest_id"], data["latest_id"]
         self.room_revision = data["room_revision"]
+        self.pinned_message = data["pinned_message"]
         self.has_more_older = data["has_more_older"]
         self._next_room_poll = time.monotonic() + (0 if data["has_more_new"] else ROOM_POLL_INTERVAL)
         if data["older_messages"] or data["new_messages"]:
             self._emit("messages", (older, had_messages))
+        self._emit("pin", None)
+
+    # Stage pages without changing the visible cache or its cursor bounds.
+    # Swap only after all pages agree; new chat after through_id arrives via sync.
+    def _apply_snapshot(self, data: dict) -> None:
+        snapshot = self._snapshot
+        snapshot["messages"].update((message["id"], message) for message in data["messages"])
+        if data["has_more"]:
+            snapshot["after_id"] = data["next_after_id"]
+            return
+        if snapshot["messages"].keys() != self.messages.keys():
+            self._emit("log", "Room reload was incomplete; keeping the displayed messages.")
+            self._snapshot = None
+            self._next_room_poll = time.monotonic() + ROOM_POLL_INTERVAL
+            return
+        had_messages = bool(self.messages)
+        self.messages = snapshot["messages"]
+        self.room_revision = data["room_revision"]
+        self.pinned_message = data["pinned_message"]
+        self._snapshot = None
+        self._snapshot_stales = 0
+        self._emit("messages", ([], had_messages))
+        self._emit("pin", None)
+        self._next_room_poll = time.monotonic()
 
     # Request cancellation without operating on the worker's socket or blocking.
     # poll() observes worker completion and makes reconnecting available afterward.
@@ -247,10 +300,21 @@ class ClientLogic:
             self._next_directory_poll = time.monotonic()
             if action == "create_group":
                 self._emit("group_created", None)
-        if action in {"open_private", "create_group", "join_group", "send_message", "sync_room"} and generation != self._room_generation:
+        if action in {"open_private", "create_group", "join_group", "send_message", "sync_room",
+                      "get_room_snapshot", "set_heart", "set_pin"} and generation != self._room_generation:
             self._set_state("connected")
             return
         if not response["ok"]:
+            if action == "get_room_snapshot" and response["error"]["code"] == "SNAPSHOT_STALE":
+                self._snapshot_stales += 1
+                if self._snapshot_stales < 2:
+                    self._snapshot.update(room_revision=response["error"]["details"]["room_revision"],
+                                          after_id=None, messages={})
+                else:
+                    self._snapshot = None
+                    self._next_room_poll = time.monotonic() + ROOM_POLL_INTERVAL
+                self._set_state("connected")
+                return
             self._emit("log", f"{response['error']['code']}: {response['error']['message']}")
             if action == "login":
                 self.disconnect()
@@ -260,6 +324,9 @@ class ClientLogic:
             if action in {"open_private", "create_group", "join_group"} or response["error"]["code"] in {"ROOM_NOT_FOUND", "NOT_ROOM_MEMBER"}:
                 self._clear_room()
             elif action == "sync_room":
+                self._next_room_poll = time.monotonic() + ROOM_POLL_INTERVAL
+            elif action == "get_room_snapshot":
+                self._snapshot = None
                 self._next_room_poll = time.monotonic() + ROOM_POLL_INTERVAL
         else:
             data = response["data"]
@@ -286,6 +353,10 @@ class ClientLogic:
                 self._next_room_poll = time.monotonic()
             elif action == "sync_room":
                 self._apply_room_sync(data)
+            elif action == "get_room_snapshot":
+                self._apply_snapshot(data)
+            elif action in {"set_heart", "set_pin"}:
+                self._next_room_poll = time.monotonic()
             else:
                 self._emit("log", f"Response #{response['request_id']}: {data}")
         self._set_state("connected")
@@ -301,7 +372,10 @@ class ClientLogic:
             self._request(action, payload, "opening")
         else:
             self._poll_directory()
-            if (self.state == "connected" and self.room is not None and self._next_room_poll is not None
+            if self.state == "connected" and self._snapshot is not None:
+                payload = {key: self._snapshot[key] for key in ("from_id", "through_id", "after_id", "room_revision")}
+                self._request("get_room_snapshot", {"room_key": self.room["room_key"], **payload}, "reloading")
+            elif (self.state == "connected" and self.room is not None and self._next_room_poll is not None
                     and time.monotonic() >= self._next_room_poll):
                 self._sync_room(20 if self.latest_id is None else 0)
 

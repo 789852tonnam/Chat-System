@@ -21,13 +21,14 @@ from common.protocol import (
     validate_group_name,
     validate_id,
     validate_room_key,
+    validate_snapshot_request,
     validate_sync_request,
     validate_username,
 )
 from server_network import ClientSession, ServerNetwork
 from database import (
-    create_group, get_or_create_user, join_group, list_groups,
-    open_database, open_private, send_message, sync_room,
+    create_group, get_or_create_user, get_room_snapshot, join_group, list_groups,
+    open_database, open_private, send_message, set_heart, set_pin, sync_room,
 )
 
 LOGGER = logging.getLogger("socket_chat.server")
@@ -210,7 +211,7 @@ class ChatServer:
                         self._prune_sessions()
                         item.response = self._handle_request(item.request, item.session)
                     except ProtocolError as exc:
-                        item.response = error_response(item.request.request_id, exc.code, exc.message)
+                        item.response = error_response(item.request.request_id, exc.code, exc.message, details=exc.details)
                     except Exception:
                         LOGGER.exception("Worker request failed")
                         item.response = error_response(
@@ -241,7 +242,8 @@ class ChatServer:
         if request.action not in KNOWN_ACTIONS:
             return error_response(request.request_id, "UNKNOWN_ACTION", "Unknown action")
         if request.action not in {"ping", "login", "logout", "get_directory", "open_private",
-                                  "create_group", "join_group", "send_message", "sync_room"}:
+                                  "create_group", "join_group", "send_message", "sync_room",
+                                  "get_room_snapshot", "set_heart", "set_pin"}:
             return error_response(
                 request.request_id,
                 "ACTION_NOT_IMPLEMENTED",
@@ -293,6 +295,24 @@ class ChatServer:
         if request.action == "sync_room":
             validate_sync_request(request.payload)
             return success_response(request.request_id, sync_room(self._database, session.user["id"], request.payload))
+        if request.action == "get_room_snapshot":
+            validate_snapshot_request(request.payload)
+            return success_response(request.request_id, get_room_snapshot(self._database, session.user["id"], request.payload))
+        if request.action in {"set_heart", "set_pin"}:
+            expected = {"room_key", "message_id", "hearted"} if request.action == "set_heart" else {"room_key", "message_id"}
+            if set(request.payload) != expected:
+                raise ProtocolError("INVALID_PAYLOAD", "Invalid mutation fields")
+            room_key = validate_room_key(request.payload["room_key"])
+            message_id = request.payload["message_id"]
+            if request.action == "set_heart" or message_id is not None:
+                validate_id(message_id, "message_id")
+            if request.action == "set_heart":
+                if type(request.payload["hearted"]) is not bool:
+                    raise ProtocolError("INVALID_PAYLOAD", "hearted must be a boolean")
+                data = set_heart(self._database, room_key, session.user["id"], message_id, request.payload["hearted"])
+            else:
+                data = set_pin(self._database, room_key, session.user["id"], message_id)
+            return success_response(request.request_id, data)
         return success_response(request.request_id, {"pong": True})
 
 

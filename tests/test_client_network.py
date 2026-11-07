@@ -295,3 +295,48 @@ class ClientNetworkTests(unittest.TestCase):
                     self.assertTrue(self.event(client, "error"))
                     self.event(client, "disconnected")
                     self.stop_client(client)
+
+    def test_malformed_heart_pin_and_snapshot_responses_are_rejected(self):
+        for broken in ("heart_id", "heart_count", "heart_owner", "pin_room", "revision", "range", "cursor", "stale"):
+            with self.subTest(broken=broken):
+                action = "set_heart" if broken.startswith("heart_") else "set_pin" if broken == "pin_room" else "get_room_snapshot"
+                class InvalidStateServer(ChatServer):
+                    def _handle_request(self, request, session):
+                        response = super()._handle_request(request, session)
+                        if request.action == action and response["ok"]:
+                            data = response["data"]
+                            if broken == "heart_id":
+                                data["message_id"] += 1
+                            elif broken == "heart_count":
+                                data["heart_count"] = True
+                            elif broken == "heart_owner":
+                                data["hearted_by_me"] = False
+                            elif broken == "pin_room":
+                                data["pinned_message"]["room_key"] = "private:1:999"
+                            elif broken == "revision":
+                                data["room_revision"] += 1
+                            elif broken == "range":
+                                data["messages"][0]["id"] += 1000
+                            elif broken == "cursor":
+                                data["next_after_id"] = 1
+                            else:
+                                return {"request_id": request.request_id, "ok": False,
+                                        "error": {"code": "SNAPSHOT_STALE", "message": "Changed"}}
+                        return response
+                server = self.server(InvalidStateServer)
+                with ChatPeer(server.address, "Bob") as bob:
+                    client = self.client(server)
+                    client.requests.put(("login", {"username": "Alice"}))
+                    alice = self.event(client, "response")["data"]["user"]
+                    key = bob.ok("open_private", {"target_user_id": alice["id"]})["room"]["room_key"]
+                    message_id = bob.ok("send_message", {"room_key": key, "content": "Test"})["message"]["id"]
+                    payload = {"room_key": key, "message_id": message_id}
+                    if action == "set_heart":
+                        payload["hearted"] = True
+                    elif action == "get_room_snapshot":
+                        payload = {"room_key": key, "from_id": message_id, "through_id": message_id,
+                                   "after_id": None, "room_revision": 0}
+                    client.requests.put((action, payload))
+                    self.assertTrue(self.event(client, "error"))
+                    self.event(client, "disconnected")
+                    self.stop_client(client)

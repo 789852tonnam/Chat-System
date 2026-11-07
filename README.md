@@ -2,7 +2,7 @@
 
 A Computer Network term project using Python, Tkinter, and TCP sockets. The planned application includes private chats, group chats, and four additional features.
 
-**Current status:** The server and Tkinter client support username-only entry, persistent user IDs, a live online directory, private and group chat with persistent history, connection management, and ping. All 124 tests passed, including SQLite persistence, real TCP loopback, and Tkinter UI tests. Reactions, pins, AI, sound playback, and Docker images are not implemented yet.
+**Current status:** The server and Tkinter client support username-only entry, persistent user IDs, a live online directory, private and group chat with persistent history, message hearts, a single room pin, connection management, and ping. All 146 tests passed, including SQLite persistence, real TCP loopback, and Tkinter UI tests. AI, sound playback, and Docker images are not implemented yet.
 
 ## Run the server
 
@@ -15,6 +15,8 @@ python3 server.py --host 127.0.0.1 --port 5000
 The server creates `data/chat.sqlite3` for persistent users. Choose another file with `--database PATH`, or use `--database :memory:` for temporary storage. The runtime `data/` directory is ignored by Git.
 
 Press Ctrl-C to stop the server. For LAN connections, bind the server to `0.0.0.0` and allow access to its TCP port. See the local [Server guide](docs/server.md) for ping examples and the thread/queue flow.
+
+For the planned AI integration, [.env.example](.env.example) shows sample endpoint, model and API-key values. Copy it to `.env` and replace the placeholder key. `.env` is ignored by Git. The current server does not load this configuration yet.
 
 ## Run the Tkinter client
 
@@ -42,7 +44,7 @@ Opening a room loads its latest 20 messages. **Load older (20)** fetches the nex
 
 Only the active room is cached in client memory. Switching rooms clears that cache, fetches history again, and ignores replies belonging to an earlier room generation. Send acknowledgements do not append messages or advance the history cursor; the next sync supplies the complete ordered update. A send error retains the input for correction. Private messages remain stored when the other participant is offline, and rooms, memberships, and messages survive a server restart using the same database.
 
-This milestone sends human messages only. Heart/pin/AI/sound fields remain empty; revision-based snapshot reload is reserved for those later features. An unexpected room revision asks the user to reopen the chat rather than claiming that reload is implemented.
+This milestone sends human messages only; AI and sound remain planned. Hearts and pins are persisted and synchronized through room revisions and paginated snapshots.
 
 ## Group conversations
 
@@ -51,6 +53,16 @@ Enter a **New group name** and choose **Create**. Names are trimmed to 1-80 Unic
 Every logged-in user can see all groups. Select one to view its public member names, then explicitly choose **Join / Open** to join or reopen it. Selecting a group alone does not reveal its messages. Existing members can use the same button without creating duplicate memberships. Creating or joining refreshes the directory immediately; other clients see membership changes through the normal 3-second directory poll.
 
 Members can read the group's earlier history and send messages. The server rejects non-member reads/writes even when a caller knows the key. Membership and history survive logout and server restarts. Group history uses the same latest-20, older-20 and active-room polling behavior as private chats; changing rooms clears the previous message cache.
+
+## Hearts and pins
+
+Click a message to select it, or place the chat cursor on it and press Enter. Choose **Heart** / **Unheart** or **Pin message**. Heart counts are shown beside each message; a filled heart marks this account's reaction. The same account on several devices counts once.
+
+Each room has one pinned message in a scrollable banner above history. Any member can replace it or choose **Unpin**, including a pin set by another member. A pin can remain visible even when its message is outside the loaded history. Removing a pin keeps the original message.
+
+Actual heart/pin changes advance one persistent `room_revision`; repeated desired-state requests do not. A changed revision reloads the entire displayed range in pages of at most 100, stages pages until they share a revision, then updates the UI while retaining history, selection and scroll. Mutation acknowledgements never advance the cached revision or message cursors. If the room changes twice while reloading, the client retains its old view and retries on the next poll.
+
+Existing database files are upgraded automatically at server startup by adding the heart table and missing pin column. Users, rooms, memberships and messages are retained. Heart/pin state survives restart. Non-members cannot mutate or read snapshots.
 
 ## Username identity
 
@@ -99,6 +111,7 @@ The links in the following tables refer to ignored files available in the develo
 
 ```text
 socket-chat/
+|-- .env.example             # Example OpenRouter endpoint, model and API key
 |-- .gitignore
 |-- README.md
 |-- server.py                # Lifecycle, queue, application worker and handlers
@@ -119,12 +132,13 @@ socket-chat/
     |-- test_groups.py
     |-- test_login.py
     |-- test_protocol.py
+    |-- test_reactions.py
     `-- test_server.py
 ```
 
 Server responsibilities are split explicitly: `server_network.py` owns accept/recv/send, framing and connection deadlines; `server.py` owns the bounded work queue, sessions, application handlers and the SQLite worker. Transport calls `submit(request, session)` and returns its response on the same connection. Both share a shutdown Event so pending response waits can exit. Startup initializes storage before opening the listener; shutdown closes transport before joining the database worker.
 
-The server and client are separate files as required by the assignment. The current server implements ping, username-only login, logout, get_directory, open_private, create_group, join_group, send_message, sync_room, and transport error responses. The directory returns all groups with their members, including groups the caller has not joined. Known application actions without handlers return `ACTION_NOT_IMPLEMENTED`; this is not a complete implementation of Protocol v1.1.
+The server and client are separate files as required by the assignment. The current server implements ping, username-only login, logout, get_directory, open_private, create_group, join_group, send_message, sync_room, get_room_snapshot, set_heart, set_pin, and transport error responses. The directory returns all groups with their members, including groups the caller has not joined. Known application actions without handlers return `ACTION_NOT_IMPLEMENTED`; this is not a complete implementation of Protocol v1.1.
 
 Local documentation distinguishes **confirmed**, **proposed**, and **unresolved** decisions. Confirming a design does not prove that it has been implemented or tested.
 

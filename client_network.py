@@ -20,9 +20,12 @@ from common.protocol import (
     validate_directory,
     validate_group_name,
     validate_message,
+    validate_mutation_response,
     validate_response,
     validate_room,
     validate_sync_response,
+    validate_snapshot_response,
+    validate_id,
     validate_user,
 )
 
@@ -113,6 +116,16 @@ class NetworkClient(threading.Thread):
                                 raise ProtocolError("INVALID_RESPONSE", "Message acknowledgement has an unexpected sender")
                         elif action == "sync_room" and response["ok"]:
                             validate_sync_response(response["data"], payload)
+                        elif action == "get_room_snapshot":
+                            if response["ok"]:
+                                validate_snapshot_response(response["data"], payload)
+                            elif response["error"]["code"] == "SNAPSHOT_STALE":
+                                revision = response["error"].get("details", {}).get("room_revision")
+                                validate_id(revision, "room_revision", zero=True)
+                                if revision == payload["room_revision"]:
+                                    raise ProtocolError("INVALID_RESPONSE", "Stale snapshot must report a different revision")
+                        elif action in {"set_heart", "set_pin"} and response["ok"]:
+                            validate_mutation_response(response["data"], payload, action)
                         self.events.put(("response", response))
         except (OSError, ProtocolError, FrameTooLarge, ValueError) as exc:
             if not self._stopping.is_set():

@@ -217,3 +217,90 @@ class ClientLogicTests(unittest.TestCase):
         self.assertEqual(self.take("get_directory"), {})
         self.assertEqual(self.logic.room, private)
         self.assertEqual(self.logic.messages, {})
+
+    def test_mutation_ack_stages_all_snapshot_pages_before_replacing_loaded_history(self):
+        self.join()
+        self.open_room(self.sync(older=[self.message(i) for i in range(86, 106)], oldest=86, latest=105, has_older=True))
+        for first in (66, 46, 26, 6, 1):
+            previous = self.logic.oldest_id
+            self.logic.load_older()
+            self.take("sync_room")
+            self.reply(self.sync(older=[self.message(i) for i in range(first, previous)], oldest=first,
+                                 latest=105, has_older=first > 1))
+        self.logic.toggle_heart(1)
+        self.assertEqual(self.take("set_heart")["hearted"], True)
+        self.reply({"room_key": "private:1:2", "message_id": 1, "hearted_by_me": True,
+                    "heart_count": 1, "room_revision": 2})
+        self.assertEqual(self.logic.room_revision, 0)
+        self.assertFalse(self.logic.messages[1]["hearted_by_me"])
+        self.assertEqual(self.take("sync_room")["latest_id"], 105)
+        self.reply({**self.sync(oldest=1, latest=105), "room_revision": 2, "reload_required": True})
+        request = self.take("get_room_snapshot")
+        self.assertEqual((request["from_id"], request["through_id"], request["room_revision"]), (1, 105, 2))
+        self.events.clear()
+        updated = {**self.message(1), "heart_count": 1, "hearted_by_me": True}
+        page = {"room_key": "private:1:2", "room_revision": 2, "pinned_message": self.message(105),
+                "messages": [updated] + [self.message(i) for i in range(2, 101)],
+                "has_more": True, "next_after_id": 100}
+        self.reply(page)
+        self.assertEqual(self.take("get_room_snapshot")["after_id"], 100)
+        self.assertFalse(self.logic.messages[1]["hearted_by_me"])
+        self.assertIsNone(self.logic.pinned_message)
+        self.assertFalse(any(kind == "messages" for kind, value in self.events))
+        self.reply({**page, "messages": [self.message(i) for i in range(101, 106)], "has_more": False, "next_after_id": None})
+        self.assertEqual(len(self.logic.messages), 105)
+        self.assertTrue(self.logic.messages[1]["hearted_by_me"])
+        self.assertEqual((self.logic.oldest_id, self.logic.latest_id, self.logic.room_revision), (1, 105, 2))
+        self.assertEqual(self.logic.pinned_message["id"], 105)
+        self.assertEqual(self.take("sync_room")["room_revision"], 2)
+        self.reply({**self.sync(newer=[self.message(106)], oldest=1, latest=106),
+                    "room_revision": 2, "pinned_message": self.message(105)})
+        self.assertEqual(len(self.logic.messages), 106)
+
+    def test_two_stale_snapshots_keep_cache_and_defer_retry_until_next_poll(self):
+        self.join()
+        self.open_room(self.sync(older=[self.message(1)], oldest=1, latest=1))
+        self.clock.return_value = 101.0
+        self.logic.poll()
+        self.take("sync_room")
+        self.reply({**self.sync(oldest=1, latest=1), "room_revision": 1, "reload_required": True})
+        self.take("get_room_snapshot")
+        self.reply(error={"code": "SNAPSHOT_STALE", "message": "Changed", "details": {"room_revision": 2}})
+        self.assertEqual(self.take("get_room_snapshot")["room_revision"], 2)
+        self.reply(error={"code": "SNAPSHOT_STALE", "message": "Changed", "details": {"room_revision": 3}})
+        self.assertTrue(self.network.requests.empty())
+        self.assertEqual(self.logic.room_revision, 0)
+        self.assertEqual(set(self.logic.messages), {1})
+        self.clock.return_value = 102.1
+        self.logic.poll()
+        self.assertEqual(self.take("sync_room")["room_revision"], 0)
+
+    def test_switching_rooms_discards_snapshot_result_and_pin(self):
+        self.join()
+        self.open_room(self.sync(older=[self.message(1)], oldest=1, latest=1))
+        self.clock.return_value = 101.0
+        self.logic.poll()
+        self.take("sync_room")
+        self.reply({**self.sync(oldest=1, latest=1), "room_revision": 1, "reload_required": True})
+        self.take("get_room_snapshot")
+        self.logic.open_chat(3, "Carol")
+        self.reply({"room_key": "private:1:2", "room_revision": 1, "messages": [self.message(1)],
+                    "pinned_message": self.message(1), "has_more": False, "next_after_id": None})
+        self.assertEqual(self.take("open_private"), {"target_user_id": 3})
+        self.assertEqual(self.logic.messages, {})
+        self.assertIsNone(self.logic.pinned_message)
+        self.assertIsNone(self.logic._snapshot)
+
+    def test_incomplete_snapshot_never_drops_existing_messages(self):
+        self.join()
+        self.open_room(self.sync(older=[self.message(1)], oldest=1, latest=1))
+        self.clock.return_value = 101.0
+        self.logic.poll()
+        self.take("sync_room")
+        self.reply({**self.sync(oldest=1, latest=1), "room_revision": 1, "reload_required": True})
+        self.take("get_room_snapshot")
+        self.reply({"room_key": "private:1:2", "room_revision": 1, "messages": [],
+                    "pinned_message": None, "has_more": False, "next_after_id": None})
+        self.assertEqual(set(self.logic.messages), {1})
+        self.assertEqual(self.logic.room_revision, 0)
+        self.assertTrue(self.network.requests.empty())
