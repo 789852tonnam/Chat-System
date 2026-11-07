@@ -1,4 +1,4 @@
-"""Tkinter connection/ping client; socket I/O lives in client_network.py."""
+"""Tkinter username-only client; socket I/O lives in client_network.py."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from tkinter import ttk
 from tkinter.scrolledtext import ScrolledText
 
 from client_network import NetworkClient
+from common.protocol import ProtocolError, validate_username
 
 
 class ClientWindow(tk.Tk):
@@ -19,7 +20,7 @@ class ClientWindow(tk.Tk):
     # Button callbacks enqueue work; only this thread reads or changes widgets.
     def __init__(self, host: str = "127.0.0.1", port: int = 5000):
         super().__init__()
-        self.title("Socket Chat - Connection")
+        self.title("Socket Chat - Join")
         self.minsize(640, 360)
         # A new worker is created for each explicit connection attempt.
         self.network: NetworkClient | None = None
@@ -31,6 +32,10 @@ class ClientWindow(tk.Tk):
         self.host = tk.StringVar(value=host)
         # Port stays text until connect() validates and converts it to an integer.
         self.port = tk.StringVar(value=str(port))
+        # Username is sent as entered; login creates or reuses its persistent ID.
+        self.username = tk.StringVar()
+        # The validated server identity is present only after a successful join.
+        self.user: dict | None = None
         # Status label updated by callbacks and _poll_events() on the main thread.
         self.status = tk.StringVar(value="Disconnected")
 
@@ -38,7 +43,7 @@ class ClientWindow(tk.Tk):
         frame = ttk.Frame(self, padding=16)
         frame.pack(fill="both", expand=True)
         frame.columnconfigure(1, weight=1)
-        frame.rowconfigure(4, weight=1)
+        frame.rowconfigure(5, weight=1)
 
         ttk.Label(frame, text="Server host").grid(row=0, column=0, sticky="w", padx=(0, 8))
         # Address input becomes read-only while its connection is in use.
@@ -49,11 +54,16 @@ class ClientWindow(tk.Tk):
         self.port_entry = ttk.Entry(frame, textvariable=self.port, width=8)
         self.port_entry.grid(row=0, column=3, sticky="ew")
 
+        ttk.Label(frame, text="Username").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(12, 0))
+        # A single username field replaces separate registration/password forms.
+        self.username_entry = ttk.Entry(frame, textvariable=self.username)
+        self.username_entry.grid(row=1, column=1, columnspan=3, sticky="ew", pady=(12, 0))
+
         # Keep connection controls together and separate from the expanding log.
         buttons = ttk.Frame(frame)
-        buttons.grid(row=1, column=0, columnspan=4, sticky="w", pady=12)
+        buttons.grid(row=2, column=0, columnspan=4, sticky="w", pady=12)
         # Starts a new worker only when the previous connection has ended.
-        self.connect_button = ttk.Button(buttons, text="Connect", command=self.connect)
+        self.connect_button = ttk.Button(buttons, text="Join", command=self.connect)
         self.connect_button.pack(side="left")
         # Cancels the worker while leaving the window available for reconnecting.
         self.disconnect_button = ttk.Button(buttons, text="Disconnect", command=self.disconnect)
@@ -62,19 +72,19 @@ class ClientWindow(tk.Tk):
         self.ping_button = ttk.Button(buttons, text="Send Ping", command=self.ping)
         self.ping_button.pack(side="left")
 
-        ttk.Label(frame, textvariable=self.status).grid(row=2, column=0, columnspan=4, sticky="w")
-        ttk.Label(frame, text="Activity").grid(row=3, column=0, columnspan=4, sticky="w", pady=(12, 4))
+        ttk.Label(frame, textvariable=self.status).grid(row=3, column=0, columnspan=4, sticky="w")
+        ttk.Label(frame, text="Activity").grid(row=4, column=0, columnspan=4, sticky="w", pady=(12, 4))
         # Read-only output; _log() temporarily enables edits to append messages.
         self.activity = ScrolledText(frame, width=72, height=12, wrap="word", state="disabled")
-        self.activity.grid(row=4, column=0, columnspan=4, sticky="nsew")
+        self.activity.grid(row=5, column=0, columnspan=4, sticky="nsew")
         self._set_state("disconnected")
-        self.host_entry.focus_set()
+        self.username_entry.focus_set()
         self.protocol("WM_DELETE_WINDOW", self.close)
         # Tk callback ID lets close() cancel a pending poll before destroying UI.
         self._poll_id: str | None = self.after(50, self._poll_events)
 
-    # Called by Connect on the main thread; reject an empty host or invalid port.
-    # Copy form values into a new worker, then return without waiting for TCP.
+    # Called by Join; validate the address and username before starting a worker.
+    # After TCP connects, _poll_events() queues the username-only login request.
     # An existing worker must finish before another connection can be started.
     def connect(self) -> None:
         if self.network is not None or self._closing:
@@ -88,6 +98,13 @@ class ClientWindow(tk.Tk):
             self.status.set("Enter a server host and a port between 1 and 65535.")
             self._log("Invalid server address.")
             (self.host_entry if not host else self.port_entry).focus_set()
+            return
+        try:
+            validate_username(self.username.get())
+        except ProtocolError as exc:
+            self.status.set(exc.message)
+            self._log(exc.message)
+            self.username_entry.focus_set()
             return
         self.network = NetworkClient(host, port)
         self._set_state("connecting")
@@ -139,10 +156,20 @@ class ClientWindow(tk.Tk):
                 except queue.Empty:
                     break
                 if kind == "connected":
-                    self._log("Connected.")
+                    self._log("TCP connected.")
                     if self._state == "connecting":
-                        self._set_state("connected")
+                        self._set_state("joining")
+                        self.network.requests.put(("login", {"username": self.username.get()}))
                 elif kind == "response":
+                    if self._state == "joining":
+                        if value["ok"]:
+                            self.user = value["data"]["user"]
+                            self._set_state("connected")
+                            self._log(f"Joined as {self.user['username']} (user #{self.user['id']}).")
+                        else:
+                            self._log(f"{value['error']['code']}: {value['error']['message']}")
+                            self.disconnect()
+                        continue
                     if value["ok"]:
                         self._log(f"Response #{value['request_id']}: {value['data']}")
                     else:
@@ -154,6 +181,7 @@ class ClientWindow(tk.Tk):
             if finished:
                 self.network.join()
                 self.network = None
+                self.user = None
                 if self._closing:
                     self.destroy()
                     return
@@ -166,15 +194,19 @@ class ClientWindow(tk.Tk):
     # Waiting disables Ping while Disconnect remains available for cancellation.
     def _set_state(self, state: str) -> None:
         self._state = state
-        self.status.set({"waiting": "Waiting for pong..."}.get(state, state.capitalize()))
+        self.status.set({
+            "waiting": "Waiting for pong...", "joining": "Joining...",
+            "connected": f"Joined as {self.user['username']}" if self.user else "Connected",
+        }.get(state, state.capitalize()))
         self.connect_button.configure(state="normal" if state == "disconnected" else "disabled")
         self.disconnect_button.configure(
-            state="normal" if state in {"connecting", "connected", "waiting"} else "disabled"
+            state="normal" if state in {"connecting", "joining", "connected", "waiting"} else "disabled"
         )
         self.ping_button.configure(state="normal" if state == "connected" else "disabled")
         entry_state = "normal" if state == "disconnected" else "readonly"
         self.host_entry.configure(state=entry_state)
         self.port_entry.configure(state=entry_state)
+        self.username_entry.configure(state=entry_state)
 
     # Append activity on the main thread, then restore the read-only widget state.
     # Limit each entry and retained line count so the log cannot grow indefinitely.

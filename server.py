@@ -1,4 +1,4 @@
-"""Transport-first Socket Chat server: per-connection I/O, one queue/worker."""
+"""TCP Socket Chat server: queued username login and persistent users."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import logging
 import math
 import queue
 import socket
+import sqlite3
 import threading
 import time
 from dataclasses import dataclass, field
@@ -24,7 +25,9 @@ from common.protocol import (
     read_request_id,
     success_response,
     validate_envelope,
+    validate_username,
 )
+from database import get_or_create_user, open_database
 
 LOGGER = logging.getLogger("socket_chat.server")
 _STOP = object()
@@ -38,6 +41,8 @@ class ServerConfig:
     frame_timeout: float = 10.0
     idle_timeout: float = 120.0
     send_timeout: float = 10.0
+    # Persistent user storage; tests pass :memory: to avoid sharing disk state.
+    database_path: str = "data/chat.sqlite3"
 
     def __post_init__(self) -> None:
         if not self.host:
@@ -46,6 +51,8 @@ class ServerConfig:
             raise ValueError("port must be between 0 and 65535")
         if type(self.queue_capacity) is not int or self.queue_capacity < 1:
             raise ValueError("queue_capacity must be a positive integer")
+        if type(self.database_path) is not str or not self.database_path:
+            raise ValueError("database_path must be a non-empty string")
         for name in ("frame_timeout", "idle_timeout", "send_timeout"):
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0:
@@ -53,9 +60,19 @@ class ServerConfig:
 
 
 @dataclass(slots=True)
+class ClientSession:
+    # Only the application worker changes the identity bound to this connection.
+    user: dict[str, Any] | None = None
+
+
+@dataclass(slots=True)
 class WorkItem:
+    # Parsed wire data and the connection-local session travel in the same job.
     request: Request
+    session: ClientSession
+    # Wake the originating I/O thread after its response is ready.
     done: threading.Event = field(default_factory=threading.Event)
+    # Filled by the worker before it sets done.
     response: dict[str, Any] | None = None
 
 
@@ -82,6 +99,12 @@ class ChatServer:
         self._listener: socket.socket | None = None
         # Thread running _worker_loop() to process queued work.
         self._worker: threading.Thread | None = None
+        # start() waits until database initialization has succeeded or failed.
+        self._worker_ready = threading.Event()
+        # Carries an initialization error back to the thread calling start().
+        self._worker_start_error: Exception | None = None
+        # Created, used, and closed exclusively on the application worker thread.
+        self._database: sqlite3.Connection | None = None
         # Thread running _accept_loop() to accept new clients.
         self._acceptor: threading.Thread | None = None
         # Prevents starting this server instance more than once.
@@ -104,8 +127,9 @@ class ChatServer:
 
     # Bind the listening socket and launch the worker and acceptor threads.
     # The lifecycle lock keeps startup and shutdown from running together.
-    # Each instance can start only once. This method returns after launching
-    # the threads; main() calls wait() to keep the process running afterward.
+    # Wait for the worker to initialize SQLite before accepting connections.
+    # Failed initialization closes the listener and is raised to the caller.
+    # Each instance starts once; main() calls wait() after successful startup.
     def start(self) -> None:
         with self._lifecycle_lock:
             if self._started or self._closed:
@@ -115,9 +139,16 @@ class ChatServer:
             self._listener = listener
             self._address = listener.getsockname()
             self._worker = threading.Thread(target=self._worker_loop, name="chat-worker")
-            self._acceptor = threading.Thread(target=self._accept_loop, name="chat-acceptor")
             self._started = True
             self._worker.start()
+            self._worker_ready.wait()
+            if self._worker_start_error is not None:
+                self._stopping.set()
+                self._close_socket(listener)
+                self._worker.join()
+                self._closed = True
+                raise self._worker_start_error
+            self._acceptor = threading.Thread(target=self._accept_loop, name="chat-acceptor")
             self._acceptor.start()
 
     # Block the calling thread until the shutdown Event is set.
@@ -199,6 +230,8 @@ class ChatServer:
     # Always close the socket and remove its registry entry when the loop exits.
     def _connection_loop(self, connection: socket.socket) -> None:
         framer = LineFramer()
+        # I/O carries this session to the worker but never changes its user.
+        session = ClientSession()
         last_request_id = 0
         last_complete = time.monotonic()
         frame_started: float | None = None
@@ -237,7 +270,7 @@ class ChatServer:
                             # Even a subsequent validation/action error consumes this ID.
                             last_request_id = request_id
                             request = validate_envelope(document, request_id)
-                            response = self._submit(request)
+                            response = self._submit(request, session)
                             if response is None:
                                 return
                         except ProtocolError as exc:
@@ -263,8 +296,8 @@ class ChatServer:
     # Called by an I/O thread: enqueue without blocking, then wait for the worker
     # to fill the response and signal done. A full queue returns SERVER_BUSY
     # without executing the request; shutdown while waiting returns None.
-    def _submit(self, request: Request) -> dict[str, Any] | None:
-        item = WorkItem(request)
+    def _submit(self, request: Request, session: ClientSession) -> dict[str, Any] | None:
+        item = WorkItem(request, session)
         try:
             self._work.put_nowait(item)
         except queue.Full:
@@ -277,47 +310,75 @@ class ChatServer:
     # Run on the single worker thread and process queued requests one at a time.
     # Store each result on its WorkItem and set done to wake the correct I/O thread.
     # Handler exceptions become INTERNAL_ERROR without killing this worker.
-    # Always mark dequeued items complete; the stop sentinel ends the loop.
+    # Own SQLite on this thread from initialization through final close.
+    # Report startup failure before accepting clients, and always mark dequeued
+    # items complete; the stop sentinel ends the loop.
     # Idle queue timeouts leave room for future maintenance work on this thread.
     def _worker_loop(self) -> None:
-        while not self._stopping.is_set():
-            try:
-                item = self._work.get(timeout=1.0)
-            except queue.Empty:
-                # Reserved for the agreed single-worker maintenance tick.
-                continue
-            try:
-                if item is _STOP:
-                    return
-                assert isinstance(item, WorkItem)
+        try:
+            self._database = open_database(self.config.database_path)
+        except Exception as exc:
+            self._worker_start_error = exc
+            self._worker_ready.set()
+            return
+        self._worker_ready.set()
+        try:
+            while not self._stopping.is_set():
                 try:
-                    item.response = self._handle_request(item.request)
-                except Exception:
-                    LOGGER.exception("Worker request failed")
-                    item.response = error_response(
-                        item.request.request_id, "INTERNAL_ERROR", "Server could not process this request"
-                    )
+                    item = self._work.get(timeout=1.0)
+                except queue.Empty:
+                    # Reserved for the agreed single-worker maintenance tick.
+                    continue
+                try:
+                    if item is _STOP:
+                        return
+                    assert isinstance(item, WorkItem)
+                    try:
+                        item.response = self._handle_request(item.request, item.session)
+                    except ProtocolError as exc:
+                        item.response = error_response(item.request.request_id, exc.code, exc.message)
+                    except Exception:
+                        LOGGER.exception("Worker request failed")
+                        item.response = error_response(
+                            item.request.request_id, "INTERNAL_ERROR", "Server could not process this request"
+                        )
+                    finally:
+                        item.done.set()
                 finally:
-                    item.done.set()
-            finally:
-                self._work.task_done()
+                    self._work.task_done()
+        finally:
+            self._database.close()
+            self._database = None
 
     # Dispatch an application request on the worker thread; do not send socket data.
     # Unknown names return UNKNOWN_ACTION; known but unfinished actions explicitly
-    # return ACTION_NOT_IMPLEMENTED. Currently only ping has a real handler,
-    # which requires an empty payload and returns the matching pong response.
-    def _handle_request(self, request: Request) -> dict[str, Any]:
+    # return ACTION_NOT_IMPLEMENTED. Login creates/reuses a persistent username
+    # and binds it to this connection; logout clears only this connection's user.
+    # Passwords and a separate registration step are intentionally absent.
+    def _handle_request(self, request: Request, session: ClientSession) -> dict[str, Any]:
         """Only the central worker calls application handlers."""
         if request.action not in KNOWN_ACTIONS:
             return error_response(request.request_id, "UNKNOWN_ACTION", "Unknown action")
-        if request.action != "ping":
+        if request.action not in {"ping", "login", "logout"}:
             return error_response(
                 request.request_id,
                 "ACTION_NOT_IMPLEMENTED",
                 "This server build does not implement this action yet",
             )
+        if request.action == "login":
+            if session.user is not None:
+                raise ProtocolError("ALREADY_AUTHENTICATED", "This connection has already joined")
+            if set(request.payload) != {"username"}:
+                raise ProtocolError("INVALID_PAYLOAD", "login requires only username")
+            username = validate_username(request.payload["username"])
+            assert self._database is not None
+            session.user = get_or_create_user(self._database, username)
+            return success_response(request.request_id, {"user": session.user})
         if request.payload:
-            return error_response(request.request_id, "INVALID_PAYLOAD", "ping requires an empty payload")
+            raise ProtocolError("INVALID_PAYLOAD", f"{request.action} requires an empty payload")
+        if request.action == "logout":
+            session.user = None
+            return success_response(request.request_id, {"logged_out": True})
         return success_response(request.request_id, {"pong": True})
 
     # Run on the server I/O thread assigned to this client and encode its response.
@@ -349,24 +410,29 @@ class ChatServer:
                 pass
 
 
+# Parse listener/storage settings and keep the process alive after startup.
+# Always stop an allocated server, including interruption while SQLite opens.
+# Startup errors become CLI errors; Ctrl-C closes owned sockets and threads.
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=5000)
+    parser.add_argument("--database", default="data/chat.sqlite3")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    server = None
     try:
-        server = ChatServer(ServerConfig(host=args.host, port=args.port))
+        server = ChatServer(ServerConfig(host=args.host, port=args.port, database_path=args.database))
         server.start()
-    except (OSError, ValueError) as exc:
-        parser.exit(1, f"Cannot start server: {exc}\n")
-    LOGGER.info("Listening on %s:%s (ping only)", *server.address)
-    try:
+        LOGGER.info("Listening on %s:%s", *server.address)
         server.wait()
     except KeyboardInterrupt:
         pass
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        parser.exit(1, f"Cannot start server: {exc}\n")
     finally:
-        server.stop()
+        if server is not None:
+            server.stop()
 
 
 if __name__ == "__main__":

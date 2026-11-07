@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import client
 from client import ClientWindow
+from common.protocol import error_response
 from server import ChatServer, ServerConfig
 
 
@@ -23,6 +24,7 @@ class ClientUITests(unittest.TestCase):
 
     def window(self, server=None):
         window = ClientWindow(*(server.address if server else ("127.0.0.1", 5000)))
+        window.username.set("Alice")
         window.withdraw()
         self.addCleanup(self.close_window, window)
         return window
@@ -39,7 +41,7 @@ class ClientUITests(unittest.TestCase):
             pass
 
     def server(self, server_class=ChatServer):
-        server = server_class(ServerConfig(host="127.0.0.1", port=0))
+        server = server_class(ServerConfig(host="127.0.0.1", port=0, database_path=":memory:"))
         server.start()
         self.addCleanup(server.stop)
         return server
@@ -62,30 +64,78 @@ class ClientUITests(unittest.TestCase):
 
     def test_connect_ping_disconnect_and_reconnect(self):
         window = self.window(self.server())
+        users = []
         for _ in range(2):
             window.connect_button.invoke()
             self.assertTrue(window.connect_button.instate(["disabled"]))
             self.pump_until(window, lambda: window._state == "connected")
             self.assertTrue(window.host_entry.instate(["readonly"]))
+            self.assertTrue(window.username_entry.instate(["readonly"]))
+            self.assertEqual(window.status.get(), "Joined as Alice")
+            users.append(window.user)
             window.ping_button.invoke()
             self.assertTrue(window.ping_button.instate(["disabled"]))
             self.pump_until(window, lambda: window._state == "connected")
-            self.assertIn("Response #1: {'pong': True}", window.activity.get("1.0", "end"))
+            self.assertIn("Response #2: {'pong': True}", window.activity.get("1.0", "end"))
             worker = window.network
             window.disconnect_button.invoke()
             self.pump_until(window, lambda: window.network is None)
             self.assertFalse(worker.is_alive())
             self.assertFalse(window.connect_button.instate(["disabled"]))
+            self.assertIsNone(window.user)
+        self.assertEqual(users[0], users[1])
+
+    def test_invalid_username_does_not_start_a_worker(self):
+        window = self.window()
+        window.username.set("invalid name")
+        window.connect_button.invoke()
+        self.assertIsNone(window.network)
+        self.assertIn("Username must", window.status.get())
+
+    def test_rejected_login_returns_to_the_join_form(self):
+        class RejectingServer(ChatServer):
+            def _handle_request(self, request, session):
+                return error_response(request.request_id, "INVALID_PAYLOAD", "Name rejected")
+
+        window = self.window(self.server(RejectingServer))
+        window.connect()
+        self.pump_until(window, lambda: window.network is None)
+        self.assertIsNone(window.user)
+        self.assertIn("Name rejected", window.activity.get("1.0", "end"))
+        self.assertFalse(window.username_entry.instate(["readonly"]))
+
+    def test_close_during_join_stops_the_network_worker(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        class JoiningServer(ChatServer):
+            def _handle_request(self, request, session):
+                entered.set()
+                release.wait(3)
+                return super()._handle_request(request, session)
+
+        window = self.window(self.server(JoiningServer))
+        try:
+            window.connect()
+            self.pump_until(window, entered.is_set)
+            self.assertEqual(window._state, "joining")
+            worker = window.network
+            window.close()
+            self.pump_until(window, lambda: window.network is None)
+            self.assertFalse(worker.is_alive())
+        finally:
+            release.set()
 
     def test_ui_remains_responsive_and_closes_while_waiting(self):
         entered = threading.Event()
         release = threading.Event()
 
         class WaitingServer(ChatServer):
-            def _handle_request(self, request):
-                entered.set()
-                release.wait(3)
-                return super()._handle_request(request)
+            def _handle_request(self, request, session):
+                if request.action == "ping":
+                    entered.set()
+                    release.wait(3)
+                return super()._handle_request(request, session)
 
         window = self.window(self.server(WaitingServer))
         try:

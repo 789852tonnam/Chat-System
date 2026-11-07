@@ -13,6 +13,7 @@ from common.protocol import (
     read_request_id,
     validate_envelope,
     validate_response,
+    validate_username,
 )
 
 
@@ -57,6 +58,13 @@ class FramingTests(unittest.TestCase):
 
 
 class RequestValidationTests(unittest.TestCase):
+    def test_username_bounds_and_characters(self):
+        for name in ["Ab3", "Alice_123", "a" * 32]:
+            self.assertEqual(validate_username(name), name)
+        for name in [None, True, 1, "", "ab", "a" * 33, " Alice", "a b", "a-b", "\u0e44\u0e17\u0e22"]:
+            with self.subTest(name=name), self.assertRaises(ProtocolError):
+                validate_username(name)
+
     def test_bad_json_and_non_finite_numbers_are_recoverable(self):
         for frame in [
             b"", b"{", b'{"x":1,"x":2}', b'{"nested":{"x":1,"x":2}}',

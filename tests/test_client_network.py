@@ -12,7 +12,7 @@ from server import ChatServer, ServerConfig
 
 class ClientNetworkTests(unittest.TestCase):
     def server(self, server_class=ChatServer):
-        server = server_class(ServerConfig(host="127.0.0.1", port=0))
+        server = server_class(ServerConfig(host="127.0.0.1", port=0, database_path=":memory:"))
         server.start()
         self.addCleanup(server.stop)
         return server
@@ -49,6 +49,33 @@ class ClientNetworkTests(unittest.TestCase):
         client.requests.put(("ping", {}))
         self.assertEqual(self.event(client, "response")["request_id"], 2)
 
+    def test_username_login_logout_and_rejoin_on_one_connection(self):
+        client = self.client(self.server())
+        client.requests.put(("login", {"username": "Alice"}))
+        alice = self.event(client, "response")["data"]["user"]
+        self.assertEqual(alice["username"], "Alice")
+        client.requests.put(("logout", {}))
+        self.assertEqual(self.event(client, "response")["data"], {"logged_out": True})
+        client.requests.put(("login", {"username": "Bob"}))
+        self.assertNotEqual(self.event(client, "response")["data"]["user"]["id"], alice["id"])
+
+    def test_invalid_login_user_response_closes_connection(self):
+        for user in [None, {"id": True, "username": "Alice"},
+                     {"id": 1, "username": "invalid name"}]:
+            with self.subTest(user=user):
+                class InvalidUserServer(ChatServer):
+                    def _send_response(self, connection, response):
+                        connection.sendall(encode_message({
+                            "request_id": response["request_id"], "ok": True, "data": {"user": user},
+                        }))
+                        return True
+
+                client = self.client(self.server(InvalidUserServer))
+                client.requests.put(("login", {"username": "Alice"}))
+                self.assertIn("invalid", self.event(client, "error"))
+                self.event(client, "disconnected")
+                self.stop_client(client)
+
     def test_explicit_reconnect_resets_request_ids(self):
         server = self.server()
         for _ in range(2):
@@ -78,10 +105,10 @@ class ClientNetworkTests(unittest.TestCase):
         release = threading.Event()
 
         class WaitingServer(ChatServer):
-            def _handle_request(self, request):
+            def _handle_request(self, request, session):
                 entered.set()
                 release.wait(3)
-                return super()._handle_request(request)
+                return super()._handle_request(request, session)
 
         client = self.client(self.server(WaitingServer))
         try:

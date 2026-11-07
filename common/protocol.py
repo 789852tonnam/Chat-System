@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
@@ -18,7 +19,7 @@ MAX_REQUEST_ID = 9_007_199_254_740_991
 # Distinguish unknown actions from known actions whose handlers are not built yet.
 KNOWN_ACTIONS = frozenset(
     {
-        "ping", "register", "login", "logout", "get_directory",
+        "ping", "login", "logout", "get_directory",
         "open_private", "create_group", "join_group", "send_message",
         "sync_room", "get_room_snapshot", "set_heart", "set_pin",
         "trigger_effect", "request_summary", "get_summary_status",
@@ -175,6 +176,17 @@ def validate_envelope(document: dict[str, Any], request_id: int) -> Request:
     if type(document["action"]) is not str or type(document["payload"]) is not dict:
         raise ProtocolError("INVALID_REQUEST", "action must be a string and payload must be an object")
     return Request(request_id, document["action"], document["payload"])
+
+
+# Apply the same username rule to UI input and incoming server login payloads.
+# Do not trim or normalize: identity matching happens in SQLite, while the first
+# spelling is preserved for display. Username-only entry does not prove ownership.
+def validate_username(username: Any) -> str:
+    if type(username) is not str or re.fullmatch(r"[A-Za-z0-9_]{3,32}", username) is None:
+        raise ProtocolError(
+            "INVALID_PAYLOAD", "Username must contain 3-32 ASCII letters, digits, or underscores",
+        )
+    return username
 
 
 # Validate a parsed response against the client's one outstanding request ID.

@@ -52,6 +52,7 @@ class ServerTests(unittest.TestCase):
         self.addCleanup(self.resources.close)
 
     def start(self, server_class=ChatServer, **config):
+        config.setdefault("database_path", ":memory:")
         server = server_class(ServerConfig(host="127.0.0.1", port=0, **config))
         server.start()
         self.addCleanup(server.stop)
@@ -114,7 +115,7 @@ class ServerTests(unittest.TestCase):
         for request_id, action, payload, code in [
             (1, "unknown", {}, "UNKNOWN_ACTION"),
             (2, "ping", {"extra": 1}, "INVALID_PAYLOAD"),
-            (3, "login", {"username": "Alice", "password": "example-pass-123"}, "ACTION_NOT_IMPLEMENTED"),
+            (3, "create_group", {"name": "Study"}, "ACTION_NOT_IMPLEMENTED"),
         ]:
             peer.send(request_id, action, payload)
             response = peer.read()
@@ -181,9 +182,9 @@ class ServerTests(unittest.TestCase):
                 super().__init__(config)
                 self.worker_ids = set()
 
-            def _handle_request(self, request):
+            def _handle_request(self, request, session):
                 self.worker_ids.add(threading.get_ident())
-                return super()._handle_request(request)
+                return super()._handle_request(request, session)
 
         server = self.start(RecordingServer)
         def exchange(request_id):
@@ -207,12 +208,12 @@ class ServerTests(unittest.TestCase):
                 self.release = threading.Event()
                 self.handled = []
 
-            def _handle_request(self, request):
+            def _handle_request(self, request, session):
                 self.handled.append(request.request_id)
                 if request.request_id == 1:
                     self.entered.set()
                     self.release.wait(3)
-                return super()._handle_request(request)
+                return super()._handle_request(request, session)
 
         server = self.start(BlockingServer, queue_capacity=1)
         a, b, c = [self.peer(server) for _ in range(3)]
@@ -234,10 +235,10 @@ class ServerTests(unittest.TestCase):
 
     def test_worker_exception_does_not_kill_the_worker(self):
         class FailingServer(ChatServer):
-            def _handle_request(self, request):
+            def _handle_request(self, request, session):
                 if request.request_id == 1:
                     raise RuntimeError("simulated failure")
-                return super()._handle_request(request)
+                return super()._handle_request(request, session)
 
         peer = self.peer(self.start(FailingServer))
         with self.assertLogs("socket_chat.server", level="ERROR"):
@@ -259,10 +260,10 @@ class ServerTests(unittest.TestCase):
 
     def test_oversized_response_becomes_a_bounded_error(self):
         class OversizedServer(ChatServer):
-            def _handle_request(self, request):
+            def _handle_request(self, request, session):
                 if request.request_id == 1:
                     return {"request_id": 1, "ok": True, "data": {"text": "x" * MAX_RESPONSE_BYTES}}
-                return super()._handle_request(request)
+                return super()._handle_request(request, session)
 
         peer = self.peer(self.start(OversizedServer))
         peer.send(1)
@@ -272,10 +273,10 @@ class ServerTests(unittest.TestCase):
 
     def test_invalid_response_does_not_break_a_connection(self):
         class InvalidResponseServer(ChatServer):
-            def _handle_request(self, request):
+            def _handle_request(self, request, session):
                 if request.request_id == 1:
                     return {"request_id": 1, "ok": True, "data": {"number": float("nan")}}
-                return super()._handle_request(request)
+                return super()._handle_request(request, session)
 
         peer = self.peer(self.start(InvalidResponseServer))
         with self.assertLogs("socket_chat.server", level="ERROR"):
