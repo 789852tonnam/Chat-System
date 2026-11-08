@@ -8,6 +8,7 @@ from tkinter import ttk
 from tkinter.scrolledtext import ScrolledText
 
 from client_logic import ClientLogic
+from client_audio import SoundPlayer
 
 
 # AI output has no human sender account, but shares the same message widgets.
@@ -27,6 +28,8 @@ class ClientWindow(tk.Tk):
         self.minsize(880, 600)
         # Owns connection lifecycle, room state, request ordering and polling.
         self.logic = ClientLogic(self._on_event)
+        # Owns only local playback; no file data passes through chat networking.
+        self.audio = SoundPlayer()
         # Editable server address passed as plain text when Join is pressed.
         self.host = tk.StringVar(value=host)
         # Logic validates and converts the port before starting a connection.
@@ -160,12 +163,14 @@ class ClientWindow(tk.Tk):
         message_actions = ttk.Frame(conversation)
         message_actions.grid(row=3, column=0, sticky="ew", pady=(4, 0))
         self.heart_button = ttk.Button(message_actions, text="Heart", command=self._heart_selected)
-        self.heart_button.pack(side="left")
+        self.heart_button.grid(row=0, column=0, sticky="w")
         self.pin_button = ttk.Button(message_actions, text="Pin message", command=self._pin_selected)
-        self.pin_button.pack(side="left", padx=6)
+        self.pin_button.grid(row=0, column=1, sticky="w", padx=6)
         self.summary_button = ttk.Button(message_actions, text="Summarize", command=self.logic.request_summary)
-        self.summary_button.pack(side="left", padx=(0, 6))
-        ttk.Label(message_actions, textvariable=self.selection_title, wraplength=180).pack(side="left")
+        self.summary_button.grid(row=1, column=0, sticky="w", pady=(4, 0))
+        self.sound_button = ttk.Button(message_actions, text="Play Rimshot", command=self.logic.trigger_effect)
+        self.sound_button.grid(row=1, column=1, sticky="w", padx=6, pady=(4, 0))
+        ttk.Label(message_actions, textvariable=self.selection_title, wraplength=360).grid(row=2, column=0, columnspan=2, sticky="w")
         # Message input remains separate from read-only history and diagnostic logs.
         composer = ttk.Frame(conversation)
         composer.grid(row=4, column=0, sticky="ew", pady=8)
@@ -295,13 +300,20 @@ class ClientWindow(tk.Tk):
             self.group_name.set("")
         elif kind == "pin":
             self._render_pin()
+        elif kind == "sound":
+            try:
+                self.audio.play()
+            except RuntimeError as exc:
+                self._log(str(exc))
         elif kind == "closed":
+            self.audio.close()
             if self._poll_id is not None:
                 self.after_cancel(self._poll_id)
             self.destroy()
 
     # Clear presentation for the previous room; logic has already dropped its cache.
     def _clear_room(self) -> None:
+        self.audio.stop()
         self._selected_message_id = None
         self.room_title.set("Select an online user and open a chat")
         self.chat.configure(state="normal")
@@ -369,6 +381,9 @@ class ClientWindow(tk.Tk):
         self._poll_id = None
         self.logic.poll()
         if not self.logic.closing or self.logic.network is not None:
+            error = self.audio.poll()
+            if error:
+                self._log(error)
             self._poll_id = self.after(50, self._poll_events)
 
     # Apply a validated full snapshot on the main thread, marking this user's row.
@@ -434,6 +449,7 @@ class ClientWindow(tk.Tk):
             "sending": "Sending message...",
             "updating": "Updating message...", "reloading": "Refreshing room state...",
             "requesting_summary": "Requesting AI summary...", "checking_summary": "Checking AI summary...",
+            "triggering_sound": "Requesting room sound...",
             "connected": f"Joined as {self.logic.user['username']}" if self.logic.user else "Connected",
         }.get(state, state.capitalize()))
         self.connect_button.configure(state="normal" if state == "disconnected" else "disabled")
@@ -449,6 +465,7 @@ class ClientWindow(tk.Tk):
         can_send = active and self.logic.room is not None and state == "connected"
         self.send_button.configure(state="normal" if can_send else "disabled")
         self.summary_button.configure(state="normal" if can_send else "disabled")
+        self.sound_button.configure(state="normal" if can_send else "disabled")
         self.older_button.configure(state="normal" if can_send and self.logic.has_more_older else "disabled")
         self.message_input.configure(state="normal" if active and self.logic.room is not None and state != "sending" else "disabled")
         entry_state = "normal" if state == "disconnected" else "readonly"

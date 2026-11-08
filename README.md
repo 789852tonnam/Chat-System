@@ -2,11 +2,11 @@
 
 A Computer Network term project using Python, Tkinter, and TCP sockets. The planned application includes private chats, group chats, and four additional features.
 
-**Current status:** The server and Tkinter client support username-only entry, persistent user IDs, a live online directory, private and group chat with persistent history, message hearts, a single room pin, AI summaries, connection management, and ping. All 168 tests passed, including SQLite persistence, real TCP loopback, and Tkinter UI tests. Sound playback and Docker images are not implemented yet.
+**Current status:** The server and Tkinter client support username-only entry, persistent user IDs, a live online directory, private and group chat with persistent history, message hearts, a single room pin, AI summaries, room sound playback, connection management, and ping. All 190 tests passed, including SQLite persistence, real TCP loopback, and Tkinter UI tests. Docker images and the two-physical-computer demonstration remain pending.
 
 ## Run the server
 
-Use Python 3.11 or later. The application uses the Python standard library and does not require additional pip packages. From the socket-chat directory:
+Use Python 3.11 or later. The Python code uses the standard library and requires no additional pip packages. Sound playback on clients requires an installed FFmpeg build with `ffplay` on PATH; the server does not need it. From the socket-chat directory:
 
 ```bash
 python3 server.py --host 127.0.0.1 --port 5000
@@ -44,7 +44,7 @@ Opening a room loads its latest 20 messages. **Load older (20)** fetches the nex
 
 Only the active room is cached in client memory. Switching rooms clears that cache, fetches history again, and ignores replies belonging to an earlier room generation. Send acknowledgements do not append messages or advance the history cursor; the next sync supplies the complete ordered update. A send error retains the input for correction. Private messages remain stored when the other participant is offline, and rooms, memberships, and messages survive a server restart using the same database.
 
-Human and AI messages share history, hearts and pins; sound remains planned. Hearts and pins are persisted and synchronized through room revisions and paginated snapshots.
+Human and AI messages share history, hearts and pins. The room sound button uses an independent transient revision. Hearts and pins are persisted and synchronized through room revisions and paginated snapshots.
 
 ## Group conversations
 
@@ -72,6 +72,14 @@ Successful output appears as an **AI** message for every member through normal p
 
 A socket wait times out after 30 seconds and the worker enforces a 60-second job deadline. Late or duplicate results are not saved. Completed job statuses expire after an hour or server restart; successful AI messages remain in history. Requests are never automatically retried or switched to another model. In-flight HTTPS cannot be interrupted by urllib: daemon API threads may finish after server shutdown, and their results are discarded.
 
+## One room sound
+
+Each client needs [FFmpeg/ffplay](https://ffmpeg.org/ffplay.html) on PATH and the bundled [SFX/sfx1.mp3](SFX/sfx1.mp3). Open a room and choose **Play Rimshot**. There is one button and one sound, with no sound selector or message selection required. It also works in an empty room.
+
+The server checks membership and advances a per-room RAM counter. Active-room polling carries the latest counter; every client viewing that room, including the requester, plays its local copy once when it changes. The acknowledgement itself does not play sound. Opening/reopening a room silently establishes a baseline, and server restart resets counters. Multiple presses between polls can collapse to one playback, and polling does not guarantee simultaneous starts on different machines.
+
+Playback launches asynchronously. A new event restarts the same clip rather than overlapping it. Leaving the room stops its clip; closing the window kills/reaps owned player processes. Missing ffplay, a missing asset or a failed player is reported in Activity while chat remains usable. There is no automatic replay after a playback error; press again after fixing the local player. The MP3 is bundled with each client, while only the event travels through chat sockets. Sound adds no database messages or heart/pin revisions.
+
 ## Username identity
 
 Usernames contain 3-32 ASCII letters, digits, or underscores, without spaces. The first join creates the user; later joins match case-insensitively and reuse its ID while retaining its original spelling. IDs survive server restarts when the same database file is used. Multiple connections may use the same identity, as previously agreed.
@@ -86,7 +94,7 @@ This is identification by name, not password authentication: anyone entering an 
 python3 -m unittest discover -s tests -v
 ```
 
-AI tests use mocked providers and temporary environment files, without loading the real `.env` or making external requests. Client logic tests run without a display or TCP sockets. GUI tests skip when no display is available. TCP tests require permission to open localhost sockets. Unicode fixtures use escape sequences in source files while still exercising multibyte UTF-8 data at runtime.
+Automated audio tests mock player processes and do not make noise. AI tests use mocked providers and temporary environment files, without loading the real `.env` or making external requests. Client logic tests run without a display or TCP sockets. GUI tests skip when no display is available. TCP tests require permission to open localhost sockets. Unicode fixtures use escape sequences in source files while still exercising multibyte UTF-8 data at runtime.
 
 ## Local documentation
 
@@ -127,17 +135,22 @@ socket-chat/
 |-- server_network.py        # TCP listener, connection threads and framing
 |-- database.py              # Worker-owned SQLite users, rooms and messages
 |-- client.py                # Tkinter widgets, callbacks and rendering
+|-- client_audio.py          # Fixed local MP3 playback and process cleanup
 |-- client_logic.py          # Application state, actions and polling
 |-- client_network.py        # Socket worker and request/result queues
+|-- SFX/
+|   `-- sfx1.mp3              # The single user-provided room sound
 |-- common/
 |   |-- __init__.py
 |   `-- protocol.py          # Shared wire-format helpers
 `-- tests/                   # Protocol, headless logic, TCP and Tkinter tests
     |-- test_chat.py
+    |-- test_client_audio.py
     |-- test_client_logic.py
     |-- test_client_network.py
     |-- test_client_ui.py
     |-- test_directory.py
+    |-- test_effects.py
     |-- test_groups.py
     |-- test_login.py
     |-- test_protocol.py
@@ -149,8 +162,8 @@ socket-chat/
 
 Server responsibilities are split explicitly: `server_network.py` owns accept/recv/send, framing and connection deadlines; `server.py` owns the bounded work queue, sessions, application handlers and the SQLite worker. Transport calls `submit(request, session)` and returns its response on the same connection. Both share a shutdown Event so pending response waits can exit. Startup initializes storage before opening the listener; shutdown closes transport before joining the database worker.
 
-The server and client are separate files as required by the assignment. The current server implements ping, username-only login, logout, get_directory, open_private, create_group, join_group, send_message, sync_room, get_room_snapshot, set_heart, set_pin, request_summary, get_summary_status, and transport error responses. The directory returns all groups with their members, including groups the caller has not joined. Known application actions without handlers return `ACTION_NOT_IMPLEMENTED`; this is not a complete implementation of Protocol v1.1.
+The server and client are separate files as required by the assignment. The current server implements ping, username-only login, logout, get_directory, open_private, create_group, join_group, send_message, sync_room, get_room_snapshot, set_heart, set_pin, request_summary, get_summary_status, trigger_effect, and transport error responses. The directory returns all groups with their members, including groups the caller has not joined. All 15 protocol actions now have handlers; unknown actions return `UNKNOWN_ACTION`. Deployment and assignment demonstration checks remain separate from local implementation tests.
 
 Local documentation distinguishes **confirmed**, **proposed**, and **unresolved** decisions. Confirming a design does not prove that it has been implemented or tested.
 
-Protocol v1.1 and the action contracts were specified by the assistant at the user's request as a shared API standard. Decisions outside that contract, such as sound playback and Docker packaging, remain in Open decisions.
+Protocol v1.1 and the action contracts were specified by the assistant at the user's request as a shared API standard. Decisions outside that contract, such as Docker packaging and demonstration setup, remain in Open decisions.

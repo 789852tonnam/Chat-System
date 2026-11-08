@@ -24,7 +24,7 @@ class ClientLogic:
     The owner calls actions and poll(), reads state, and handles synchronous
     events: state, log, input_error, directory, room_cleared, room_title,
     messages (new older messages, previous-history flag), sent, group_created,
-    pin and closed. A directory event carries the full online-user/group snapshot.
+    pin, sound and closed. A directory event carries the full online-user/group snapshot.
     Only NetworkClient performs socket I/O on its existing worker thread.
     """
 
@@ -72,6 +72,8 @@ class ClientLogic:
         self.room_revision: int | None = None
         # May reference a message older than the loaded history range.
         self.pinned_message: dict | None = None
+        # First sync establishes a silent baseline; later changes play once.
+        self._effect_revision: int | None = None
         # Staged pages stay separate until the entire range has one revision.
         self._snapshot: dict | None = None
         # After two stale pages, defer another attempt to the next normal poll.
@@ -206,6 +208,12 @@ class ClientLogic:
         if self.room is not None and self.state == "connected":
             self._request("request_summary", {"room_key": self.room["room_key"]}, "requesting_summary")
 
+    # Ask the server to advance the room sound counter, even in an empty room.
+    # Do not play locally here or on acknowledgement; requester also waits for sync.
+    def trigger_effect(self) -> None:
+        if self.room is not None and self.state == "connected":
+            self._request("trigger_effect", {"room_key": self.room["room_key"]}, "triggering_sound")
+
     # Keep status notices scoped to their room; successful text is received by sync.
     def _apply_summary_status(self, job: dict) -> None:
         tracked = self._summary_jobs.get(job["job_id"])
@@ -241,6 +249,7 @@ class ClientLogic:
         self.messages.clear()
         self.oldest_id = self.latest_id = self.room_revision = None
         self.pinned_message = None
+        self._effect_revision = None
         self._snapshot = None
         self._snapshot_stales = 0
         self.has_more_older = False
@@ -250,6 +259,11 @@ class ClientLogic:
     # Merge validated patches, deduplicate messages and apply server-delivered bounds.
     # Tell the view which older messages were added so it can retain its scroll anchor.
     def _apply_room_sync(self, data: dict) -> None:
+        revision = data["effect_revision"]
+        previous = self._effect_revision
+        self._effect_revision = revision
+        if previous is not None and revision != previous and revision > 0:
+            self._emit("sound", "rimshot")
         if data["reload_required"]:
             self._snapshot = {"from_id": self.oldest_id,
                               "through_id": self.latest_id if self.oldest_id is not None else None,
@@ -355,7 +369,7 @@ class ClientLogic:
             if action == "create_group":
                 self._emit("group_created", None)
         if action in {"open_private", "create_group", "join_group", "send_message", "sync_room",
-                      "get_room_snapshot", "set_heart", "set_pin"} and generation != self._room_generation:
+                      "get_room_snapshot", "set_heart", "set_pin", "trigger_effect"} and generation != self._room_generation:
             self._set_state("connected")
             return
         if not response["ok"]:
@@ -409,7 +423,7 @@ class ClientLogic:
                 self._apply_room_sync(data)
             elif action == "get_room_snapshot":
                 self._apply_snapshot(data)
-            elif action in {"set_heart", "set_pin"}:
+            elif action in {"set_heart", "set_pin", "trigger_effect"}:
                 self._next_room_poll = time.monotonic()
             elif action == "get_summary_status":
                 self._apply_summary_status(data["job"])

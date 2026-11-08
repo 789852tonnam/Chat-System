@@ -127,6 +127,8 @@ class ChatServer:
         self._ai_config = ai_config
         # Worker-owned transient job statuses; credentials never enter these records.
         self._summary_jobs: dict[str, dict] = {}
+        # Worker-owned transient sound counter per room; only one sound exists.
+        self._effects: dict[str, int] = {}
         # Worker tracks API threads; they never access SQLite or mutate job state.
         self._ai_threads: set[threading.Thread] = set()
         # Each instance is single-use, including after failed startup.
@@ -254,6 +256,7 @@ class ChatServer:
         finally:
             self._sessions.clear()
             self._summary_jobs.clear()
+            self._effects.clear()
             self._database.close()
             self._database = None
 
@@ -354,7 +357,7 @@ class ChatServer:
             return error_response(request.request_id, "UNKNOWN_ACTION", "Unknown action")
         if request.action not in {"ping", "login", "logout", "get_directory", "open_private",
                                   "create_group", "join_group", "send_message", "sync_room",
-                                  "get_room_snapshot", "set_heart", "set_pin", "request_summary", "get_summary_status"}:
+                                  "get_room_snapshot", "set_heart", "set_pin", "request_summary", "get_summary_status", "trigger_effect"}:
             return error_response(
                 request.request_id,
                 "ACTION_NOT_IMPLEMENTED",
@@ -405,7 +408,17 @@ class ChatServer:
             return success_response(request.request_id, send_message(self._database, room_key, session.user["id"], content))
         if request.action == "sync_room":
             validate_sync_request(request.payload)
-            return success_response(request.request_id, sync_room(self._database, session.user["id"], request.payload))
+            data = sync_room(self._database, session.user["id"], request.payload)
+            revision = self._effects.get(request.payload["room_key"], 0)
+            data.update(effect_revision=revision, effect={"sound_id": "rimshot"} if revision else None)
+            return success_response(request.request_id, data)
+        if request.action == "trigger_effect":
+            if set(request.payload) != {"room_key"}:
+                raise ProtocolError("INVALID_PAYLOAD", "trigger_effect requires only room_key")
+            room_key = validate_room_key(request.payload["room_key"])
+            require_room(self._database, room_key, session.user["id"])
+            self._effects[room_key] = self._effects.get(room_key, 0) + 1
+            return success_response(request.request_id, {"triggered": True})
         if request.action == "get_room_snapshot":
             validate_snapshot_request(request.payload)
             return success_response(request.request_id, get_room_snapshot(self._database, session.user["id"], request.payload))

@@ -383,3 +383,26 @@ class ClientNetworkTests(unittest.TestCase):
                     self.assertTrue(self.event(client, "error"))
                     self.event(client, "disconnected")
                     self.stop_client(client)
+
+    def test_invalid_sound_acknowledgement_or_effect_closes_connection(self):
+        for broken in ("ack", "effect"):
+            with self.subTest(broken=broken):
+                class InvalidSoundServer(ChatServer):
+                    def _handle_request(self, request, session):
+                        response = super()._handle_request(request, session)
+                        if response["ok"]:
+                            if broken == "ack" and request.action == "trigger_effect":
+                                response["data"]["triggered"] = 1
+                            elif broken == "effect" and request.action == "sync_room":
+                                response["data"].update(effect_revision=1, effect={"sound_id": "unknown-file"})
+                        return response
+                server = self.server(InvalidSoundServer)
+                with ChatPeer(server.address, "Bob") as bob:
+                    client = self.client(server)
+                    client.requests.put(("login", {"username": "Alice"}))
+                    alice = self.event(client, "response")["data"]["user"]
+                    key = bob.ok("open_private", {"target_user_id": alice["id"]})["room"]["room_key"]
+                    client.requests.put(("trigger_effect", {"room_key": key}) if broken == "ack" else ("sync_room", initial_sync(key)))
+                    self.assertTrue(self.event(client, "error"))
+                    self.event(client, "disconnected")
+                    self.stop_client(client)

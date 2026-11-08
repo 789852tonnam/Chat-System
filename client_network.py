@@ -132,6 +132,9 @@ class NetworkClient(threading.Thread):
                             validate_summary_ack(response["data"])
                         elif action == "get_summary_status" and response["ok"]:
                             validate_summary_status(response["data"], payload["job_id"])
+                        elif action == "trigger_effect" and response["ok"]:
+                            if response["data"].get("triggered") is not True:
+                                raise ProtocolError("INVALID_RESPONSE", "Invalid sound acknowledgement")
                         self.events.put(("response", response))
         except (OSError, ProtocolError, FrameTooLarge, ValueError) as exc:
             if not self._stopping.is_set():

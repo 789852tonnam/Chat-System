@@ -194,12 +194,12 @@ class ServerTests(unittest.TestCase):
         peer.send(1)
         self.assert_pong(peer, 1)
 
-    def test_unknown_payload_and_unimplemented_actions_are_explicit(self):
+    def test_unknown_payload_and_unauthenticated_actions_are_explicit(self):
         peer = self.peer(self.start())
         for request_id, action, payload, code in [
             (1, "unknown", {}, "UNKNOWN_ACTION"),
             (2, "ping", {"extra": 1}, "INVALID_PAYLOAD"),
-            (3, "trigger_effect", {"room_key": "private:1:2"}, "ACTION_NOT_IMPLEMENTED"),
+            (3, "trigger_effect", {"room_key": "private:1:2"}, "UNAUTHENTICATED"),
         ]:
             peer.send(request_id, action, payload)
             response = peer.read()

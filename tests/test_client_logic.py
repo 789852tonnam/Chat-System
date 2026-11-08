@@ -379,3 +379,81 @@ class ClientLogicTests(unittest.TestCase):
         self.reply(error={"code": "SUMMARY_JOB_NOT_FOUND", "message": "Expired"})
         self.assertNotIn(job_id, self.logic._summary_jobs)
         self.assertTrue(self.network.requests.empty())
+
+    def test_sound_plays_from_sync_once_for_requester_not_from_ack(self):
+        self.join()
+        self.open_room()
+        self.events.clear()
+        self.logic.trigger_effect()
+        self.assertEqual(self.take("trigger_effect"), {"room_key": "private:1:2"})
+        self.reply({"triggered": True})
+        self.assertEqual(self.logic._effect_revision, 0)
+        self.assertFalse(any(kind == "sound" for kind, value in self.events))
+        self.take("sync_room")
+        self.reply({**self.sync(), "effect_revision": 1, "effect": {"sound_id": "rimshot"}})
+        self.assertEqual([value for kind, value in self.events if kind == "sound"], ["rimshot"])
+        self.clock.return_value = 101.1
+        self.logic.poll()
+        self.take("sync_room")
+        self.reply({**self.sync(), "effect_revision": 1, "effect": {"sound_id": "rimshot"}})
+        self.assertEqual(sum(kind == "sound" for kind, value in self.events), 1)
+        self.assertEqual(self.logic.messages, {})
+        self.assertEqual((self.logic.latest_id, self.logic.room_revision), (0, 0))
+
+    def test_initial_or_reopened_room_is_silent_and_revision_jumps_play_once(self):
+        self.join()
+        self.open_room({**self.sync(), "effect_revision": 7, "effect": {"sound_id": "rimshot"}})
+        self.assertFalse(any(kind == "sound" for kind, value in self.events))
+        self.open_room({**self.sync(), "effect_revision": 8, "effect": {"sound_id": "rimshot"}})
+        self.assertFalse(any(kind == "sound" for kind, value in self.events))
+        self.clock.return_value = 101.1
+        self.logic.poll()
+        self.take("sync_room")
+        self.reply({**self.sync(), "effect_revision": 11, "effect": {"sound_id": "rimshot"}})
+        self.assertEqual(sum(kind == "sound" for kind, value in self.events), 1)
+        self.assertEqual(self.logic._effect_revision, 11)
+
+    def test_sound_baseline_survives_heart_pin_snapshot_reload(self):
+        self.join()
+        self.open_room()
+        self.clock.return_value = 101.1
+        self.logic.poll()
+        self.take("sync_room")
+        self.reply({**self.sync(), "room_revision": 1, "reload_required": True,
+                    "effect_revision": 2, "effect": {"sound_id": "rimshot"}})
+        self.take("get_room_snapshot")
+        self.assertEqual(sum(kind == "sound" for kind, value in self.events), 1)
+        self.reply({"room_key": "private:1:2", "room_revision": 1, "messages": [],
+                    "pinned_message": None, "has_more": False, "next_after_id": None})
+        self.take("sync_room")
+        self.reply({**self.sync(), "room_revision": 1, "effect_revision": 2, "effect": {"sound_id": "rimshot"}})
+        self.assertEqual(sum(kind == "sound" for kind, value in self.events), 1)
+        self.assertEqual(self.logic._effect_revision, 2)
+
+    def test_old_room_sound_response_is_discarded_and_new_room_sets_baseline(self):
+        self.join()
+        self.open_room()
+        self.clock.return_value = 101.1
+        self.logic.poll()
+        self.take("sync_room")
+        self.logic.open_chat(3, "Carol")
+        self.reply({**self.sync(), "effect_revision": 99, "effect": {"sound_id": "rimshot"}})
+        self.take("open_private")
+        self.assertIsNone(self.logic._effect_revision)
+        self.assertFalse(any(kind == "sound" for kind, value in self.events))
+        self.reply({"room": {"room_key": "private:1:3", "kind": "private", "name": None,
+                             "members": [self.alice, {"id": 3, "username": "Carol"}]}, "created": True})
+        self.take("sync_room")
+        self.reply({**self.sync(), "room_key": "private:1:3", "effect_revision": 50, "effect": {"sound_id": "rimshot"}})
+        self.assertEqual(self.logic._effect_revision, 50)
+        self.assertFalse(any(kind == "sound" for kind, value in self.events))
+
+    def test_failed_trigger_does_not_play_or_change_baseline(self):
+        self.join()
+        self.open_room()
+        self.logic.trigger_effect()
+        self.take("trigger_effect")
+        self.reply(error={"code": "SERVER_BUSY", "message": "Busy"})
+        self.assertEqual(self.logic._effect_revision, 0)
+        self.assertFalse(any(kind == "sound" for kind, value in self.events))
+        self.assertEqual(self.logic.state, "connected")

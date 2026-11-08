@@ -359,3 +359,25 @@ class SummaryValidationTests(unittest.TestCase):
                        {"state": "failed", "completed_at": "later", "error": {"code": "AI_FAILED", "message": "Oops", "retry_after_seconds": True}}]:
             with self.subTest(change=change), self.assertRaises(ProtocolError):
                 validate_summary_status({"job": {**job, **change}}, job_id)
+
+
+class SoundValidationTests(unittest.TestCase):
+    def setUp(self):
+        self.request = {"room_key": "private:1:2", "old_count": 0, "oldest_id": None, "latest_id": 0, "room_revision": 0}
+        self.data = {"room_key": "private:1:2", "older_messages": [], "new_messages": [], "oldest_id": None,
+                     "latest_id": 0, "has_more_older": False, "has_more_new": False, "reload_required": False,
+                     "room_revision": 0, "pinned_message": None, "effect_revision": 0, "effect": None}
+
+    def test_zero_and_positive_sound_revisions_have_matching_effect(self):
+        validate_sync_response(self.data, self.request)
+        validate_sync_response({**self.data, "effect_revision": 1, "effect": {"sound_id": "rimshot"}}, self.request)
+        validate_sync_response({**self.data, "effect_revision": 100, "effect": {"sound_id": "rimshot"}}, self.request)
+
+    def test_invalid_sound_id_shape_or_revision_never_reaches_playback(self):
+        for change in [{"effect_revision": True}, {"effect_revision": -1},
+                       {"effect_revision": 1}, {"effect": {"sound_id": "rimshot"}},
+                       {"effect_revision": 1, "effect": {"sound_id": "other"}},
+                       {"effect_revision": 1, "effect": {"sound_id": "rimshot", "path": "/tmp/other.mp3"}},
+                       {"effect_revision": 1, "effect": "rimshot"}]:
+            with self.subTest(change=change), self.assertRaises(ProtocolError):
+                validate_sync_response({**self.data, **change}, self.request)

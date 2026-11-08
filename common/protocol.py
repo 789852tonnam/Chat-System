@@ -504,8 +504,12 @@ def validate_sync_response(data: dict[str, Any], request: dict[str, Any]) -> Non
         validate_id(data["oldest_id"], "oldest_id")
     validate_id(data["latest_id"], "latest_id", zero=True)
     _validate_pin(data, request["room_key"])
-    if data.get("effect") is not None or data["effect_revision"] != 0:
-        raise ProtocolError("INVALID_RESPONSE", "This client build does not support sound state yet")
+    effect = data["effect"]
+    if data["effect_revision"] == 0:
+        if effect is not None:
+            raise ProtocolError("INVALID_RESPONSE", "Zero sound revision must not include an effect")
+    elif type(effect) is not dict or effect != {"sound_id": "rimshot"}:
+        raise ProtocolError("INVALID_RESPONSE", "Invalid sound effect")
     expected_reload = request["room_revision"] is not None and request["room_revision"] != data["room_revision"]
     if data["reload_required"] != expected_reload:
         raise ProtocolError("INVALID_RESPONSE", "Reload flag does not match the requested revision")

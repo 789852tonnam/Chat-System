@@ -5,7 +5,7 @@ import threading
 import time
 import tkinter as tk
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import client
 from client import ClientWindow
@@ -553,3 +553,70 @@ class ClientUITests(unittest.TestCase):
                 self.assertGreaterEqual(y, 0)
                 self.assertLessEqual(x + widget.winfo_width(), alice.winfo_width())
                 self.assertLessEqual(y + widget.winfo_height(), alice.winfo_height())
+
+
+    def test_room_sound_reaches_both_windows_once_and_late_open_is_silent(self):
+        audio = [Mock(), Mock(), Mock()]
+        for player in audio:
+            player.poll.return_value = None
+        with patch("client.SoundPlayer", side_effect=audio), patch("client_logic.DIRECTORY_POLL_INTERVAL", 0.3), \
+                patch("client_logic.ROOM_POLL_INTERVAL", 0.15):
+            server = self.server()
+            raw_bob, raw_carol = self.raw_peer(server, "Bob"), self.raw_peer(server, "Carol")
+            alice, bob = self.window(server), self.window(server, "Bob")
+            alice.connect()
+            bob.connect()
+            self.open_room(alice, raw_bob.user["id"])
+            self.open_room(bob, alice.logic.user["id"])
+            key = alice.logic.room["room_key"]
+            self.pump_until(alice, lambda: not alice.sound_button.instate(["disabled"]))
+            alice.sound_button.invoke()
+            self.pump_until(alice, lambda: audio[0].play.call_count == 1 and audio[1].play.call_count == 1)
+            heartbeat = threading.Event()
+            alice.after(400, heartbeat.set)
+            self.pump_until(alice, heartbeat.is_set)
+            self.assertEqual((audio[0].play.call_count, audio[1].play.call_count), (1, 1))
+            late = self.window(server, "Bob")
+            late.connect()
+            self.open_room(late, alice.logic.user["id"])
+            self.assertEqual(late.logic._effect_revision, 1)
+            audio[2].play.assert_not_called()
+            previous_stops = audio[0].stop.call_count
+            self.open_room(alice, raw_carol.user["id"])
+            self.assertGreater(audio[0].stop.call_count, previous_stops)
+            raw_bob.ok("trigger_effect", {"room_key": key})
+            self.pump_until(bob, lambda: audio[1].play.call_count == 2 and audio[2].play.call_count == 1)
+            self.assertEqual(audio[0].play.call_count, 1)
+            self.assertEqual(alice.logic._effect_revision, 0)
+            self.assertEqual(alice.logic.messages, {})
+
+    def test_sound_error_keeps_chat_responsive_and_close_cleans_up_player(self):
+        audio = Mock()
+        audio.poll.return_value = None
+        audio.play.side_effect = RuntimeError("Cannot play sound: install FFmpeg with ffplay available on PATH.")
+        with patch("client.SoundPlayer", return_value=audio), patch("client_logic.ROOM_POLL_INTERVAL", 0.15):
+            server = self.server()
+            bob = self.raw_peer(server, "Bob")
+            window = self.window(server)
+            window.deiconify()
+            window.geometry("880x600")
+            window.connect()
+            self.open_room(window, bob.user["id"])
+            bob.ok("trigger_effect", {"room_key": window.logic.room["room_key"]})
+            self.pump_until(window, lambda: "install FFmpeg" in window.activity.get("1.0", "end"))
+            heartbeat = threading.Event()
+            window.after(400, heartbeat.set)
+            self.pump_until(window, heartbeat.is_set)
+            self.assertEqual(audio.play.call_count, 1)
+            self.assertTrue(window.logic.network.is_alive())
+            window.update_idletasks()
+            for widget in (window.sound_button, window.summary_button, window.send_button):
+                x = widget.winfo_rootx() - window.winfo_rootx()
+                y = widget.winfo_rooty() - window.winfo_rooty()
+                self.assertLessEqual(x + widget.winfo_width(), window.winfo_width())
+                self.assertLessEqual(y + widget.winfo_height(), window.winfo_height())
+            worker = window.logic.network
+            window.close()
+            self.pump_until(window, lambda: window.logic.network is None)
+            self.assertFalse(worker.is_alive())
+            audio.close.assert_called()
