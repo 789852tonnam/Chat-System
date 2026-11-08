@@ -60,6 +60,8 @@ class ClientLogic:
         self._room_generation = 0
         # Latest private/group opening takes priority after in-flight work finishes.
         self._queued_room: tuple[str, dict] | None = None
+        # One accepted user command waits behind polling; never queues more polls.
+        self._queued_request: tuple[str, dict, str] | None = None
         # Metadata for the single active conversation; other rooms are not cached.
         self.room: dict | None = None
         # Deduplicate history patches by global message ID within the active room.
@@ -82,6 +84,21 @@ class ClientLogic:
         self.has_more_older = False
         # Active-room poll deadline; None while a room sync is pending.
         self._next_room_poll: float | None = None
+
+    # Routine polling leaves actions available; accepting a user command makes
+    # its progress visible and prevents duplicate clicks until the reply arrives.
+    # The real state and pending context still serialize all network requests.
+    @property
+    def display_state(self) -> str:
+        if self._queued_request is not None:
+            return self._queued_request[2]
+        if self._queued_room is not None:
+            return "opening"
+        if (self.state in {"refreshing", "reloading", "checking_summary"}
+                or (self.state == "syncing" and self.latest_id is not None
+                    and self._pending_payload.get("old_count") == 0)):
+            return "connected"
+        return self.state
 
     # Validate plain form values before allocating a network worker.
     # Capture the username now; TCP connection completion queues login later.
@@ -112,16 +129,20 @@ class ClientLogic:
         self._emit("log", f"Connecting to {host}:{port_number}...")
         self.network.start()
 
-    # Queue one ping only while idle; state guards reject repeated clicks.
+    # Accept one ping while idle or polling; a waiting command rejects repeats.
     def ping(self) -> None:
-        if self.network is None or self.state != "connected":
+        if self.network is None or self.display_state != "connected":
             return
         self._emit("log", "Sending ping...")
         self._request("ping", {}, "waiting")
 
-    # Record reply context before enqueuing work on the one network connection.
-    # Only this main-thread logic changes application request bookkeeping.
+    # Keep one foreground command behind the running poll, preserving its reply
+    # context. Only the main thread owns this slot and dispatches network requests.
     def _request(self, action: str, payload: dict, state: str) -> None:
+        if self._pending_action is not None:
+            self._queued_request = (action, payload, state)
+            self._set_state(state)
+            return
         self._pending_action = action
         self._pending_payload = payload
         self._pending_generation = self._room_generation
@@ -145,7 +166,7 @@ class ClientLogic:
     # Validate a group name and create it as the only initial member.
     # Open the new room after acknowledgement, unless the user switches meanwhile.
     def create_group(self, name: str) -> None:
-        if self.user is None or self.state != "connected":
+        if self.user is None or self.display_state != "connected":
             return
         try:
             name = validate_group_name(name)
@@ -172,7 +193,7 @@ class ClientLogic:
     # Validate message text locally; the server validates and persists it again.
     # A send acknowledgement schedules sync instead of advancing history cursors.
     def send(self, content: str) -> None:
-        if self.room is None or self.state != "connected":
+        if self.room is None or self.display_state != "connected":
             return
         try:
             content = validate_content(content)
@@ -181,16 +202,16 @@ class ClientLogic:
             return
         self._request("send_message", {"room_key": self.room["room_key"], "content": content}, "sending")
 
-    # Request older messages only when history remains and the connection is idle.
+    # Accept older history while idle or polling; dispatch uses fresh cursors.
     def load_older(self) -> None:
-        if self.room is not None and self.state == "connected" and self.has_more_older:
+        if self.room is not None and self.display_state == "connected" and self.has_more_older:
             self._sync_room(20)
 
     # Derive the desired account heart state from the selected cached message.
     # Acknowledgement schedules sync; it never advances the cached room revision.
     def toggle_heart(self, message_id: int) -> None:
         message = self.messages.get(message_id)
-        if self.room is None or self.state != "connected" or message is None:
+        if self.room is None or self.display_state != "connected" or message is None:
             return
         self._request("set_heart", {"room_key": self.room["room_key"], "message_id": message_id,
                                     "hearted": not message["hearted_by_me"]}, "updating")
@@ -198,20 +219,20 @@ class ClientLogic:
     # Pin a displayed message or clear the current banner using a null ID.
     # Every member can replace/remove a pin, regardless of who set it.
     def set_pin(self, message_id: int | None) -> None:
-        if self.room is None or self.state != "connected" or (message_id is not None and message_id not in self.messages):
+        if self.room is None or self.display_state != "connected" or (message_id is not None and message_id not in self.messages):
             return
         self._request("set_pin", {"room_key": self.room["room_key"], "message_id": message_id}, "updating")
 
     # Start an independent job; the acknowledgement does not wait for the provider.
     # Another summary can be requested while earlier jobs run in the background.
     def request_summary(self) -> None:
-        if self.room is not None and self.state == "connected":
+        if self.room is not None and self.display_state == "connected":
             self._request("request_summary", {"room_key": self.room["room_key"]}, "requesting_summary")
 
     # Ask the server to advance the room sound counter, even in an empty room.
     # Do not play locally here or on acknowledgement; requester also waits for sync.
     def trigger_effect(self) -> None:
-        if self.room is not None and self.state == "connected":
+        if self.room is not None and self.display_state == "connected":
             self._request("trigger_effect", {"room_key": self.room["room_key"]}, "triggering_sound")
 
     # Keep status notices scoped to their room; successful text is received by sync.
@@ -245,6 +266,7 @@ class ClientLogic:
     def _clear_room(self) -> None:
         self._room_generation += 1
         self._queued_room = None
+        self._queued_request = None
         self.room = None
         self.messages.clear()
         self.oldest_id = self.latest_id = self.room_revision = None
@@ -310,6 +332,8 @@ class ClientLogic:
     # Request cancellation without operating on the worker's socket or blocking.
     # poll() observes worker completion and makes reconnecting available afterward.
     def disconnect(self) -> None:
+        self._queued_request = None
+        self._queued_room = None
         if self.network is not None:
             self._set_state("disconnecting")
             self.network.stop()
@@ -317,6 +341,8 @@ class ClientLogic:
     # Stop accepting new connection attempts and close after the worker has exited.
     # The closed event lets the window cancel its Tk timer and destroy widgets.
     def close(self) -> None:
+        self._queued_request = None
+        self._queued_room = None
         self.closing = True
         if self.network is None:
             self._emit("closed", None)
@@ -327,6 +353,8 @@ class ClientLogic:
     # Final process cleanup when the Tk main loop can no longer call poll().
     # Unlike close(), this waits for worker exit and emits no widget updates.
     def shutdown(self) -> None:
+        self._queued_request = None
+        self._queued_room = None
         self.closing = True
         if self.network is not None:
             self.network.stop()
@@ -431,15 +459,26 @@ class ClientLogic:
                 self._emit("log", f"Response #{response['request_id']}: {data}")
         self._set_state("connected")
 
-    # Prioritize the latest room switch, then directory and active-room polling.
-    # State changes at enqueue time ensure that no second request is stacked.
+    # Finish the one in-flight request, then prioritize room changes and user
+    # commands over new polls. Older history waits for any staged snapshot first.
     def _schedule_requests(self) -> None:
-        if self.network is None or self.state != "connected":
+        if self.network is None or self.state != "connected" or self._pending_action is not None:
             return
         if self._queued_room is not None:
             action, payload = self._queued_room
             self._queued_room = None
             self._request(action, payload, "opening")
+        elif self._queued_request is not None:
+            action, payload, state = self._queued_request
+            if action == "sync_room" and self._snapshot is not None:
+                page = {key: self._snapshot[key] for key in ("from_id", "through_id", "after_id", "room_revision")}
+                self._request("get_room_snapshot", {"room_key": self.room["room_key"], **page}, "reloading")
+            else:
+                self._queued_request = None
+                if action == "sync_room":
+                    self._sync_room(payload["old_count"])
+                else:
+                    self._request(action, payload, state)
         else:
             self._poll_directory()
             if self.state == "connected" and self._snapshot is not None:
@@ -494,7 +533,8 @@ class ClientLogic:
     # Poll after each completed directory response; missed polls never accumulate.
     # An existing user request takes precedence over this background refresh.
     def _poll_directory(self) -> None:
-        if (self.network is not None and self.state == "connected" and self._queued_room is None
+        if (self.network is not None and self.state == "connected" and self._pending_action is None
+                and self._queued_room is None and self._queued_request is None
                 and self._next_directory_poll is not None
                 and time.monotonic() >= self._next_directory_poll):
             self._next_directory_poll = None

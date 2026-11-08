@@ -68,6 +68,27 @@ class ClientLogicTests(unittest.TestCase):
         })
         self.reply(self.sync() if initial is None else initial)
 
+    # Status presentation must distinguish automatic sync from initial or manual
+    # history loads without changing the busy state used by request guards.
+    def test_display_state_hides_background_progress_only(self):
+        for state in ("refreshing", "reloading", "checking_summary"):
+            with self.subTest(state=state):
+                self.logic.state = state
+                self.assertEqual(self.logic.display_state, "connected")
+                self.assertEqual(self.logic.state, state)
+        self.logic.state = "syncing"
+        self.logic._pending_payload = {"old_count": 20}
+        self.assertEqual(self.logic.display_state, "syncing")
+        self.logic.latest_id = 0
+        self.assertEqual(self.logic.display_state, "syncing")
+        self.logic._pending_payload = {"old_count": 0}
+        self.assertEqual(self.logic.display_state, "connected")
+        self.logic.latest_id = None
+        self.assertEqual(self.logic.display_state, "syncing")
+        for state in ("sending", "opening", "waiting", "disconnecting", "disconnected"):
+            self.logic.state = state
+            self.assertEqual(self.logic.display_state, state)
+
     def test_invalid_form_values_never_allocate_a_network_worker(self):
         for host, port, username, field in [
             ("", "5000", "Alice", "host"),
@@ -81,6 +102,129 @@ class ClientLogicTests(unittest.TestCase):
                 self.assertEqual(self.events[-1][1][0], field)
                 self.assertEqual(self.logic.state, "disconnected")
         self.factory.assert_not_called()
+
+    # Accept one foreground action during polling, without overwriting the
+    # outstanding reply context or sending another request before it completes.
+    def test_send_during_poll_waits_then_runs_before_more_polling(self):
+        self.join()
+        self.open_room()
+        self.clock.return_value = 104.0
+        self.logic.poll()
+        self.take("get_directory")
+        self.logic.send("Queued while polling")
+        self.assertEqual(self.logic.display_state, "sending")
+        self.assertEqual(self.logic._pending_action, "get_directory")
+        self.assertTrue(self.network.requests.empty())
+        self.logic.send("Ignore a repeated click")
+        self.reply({"online_users": [self.alice], "groups": []})
+        self.assertEqual(self.take("send_message"), {
+            "room_key": "private:1:2", "content": "Queued while polling"})
+        self.reply(error={"code": "SERVER_BUSY", "message": "Try later"})
+        self.assertNotIn(("sent", None), self.events)
+
+    # Older history is an intent: build its cursor payload after the running
+    # room poll completes, so a new message cannot make the queued bounds stale.
+    def test_queued_older_history_uses_completed_poll_cursors(self):
+        self.join()
+        self.open_room(self.sync(newer=[self.message(10)], oldest=10, latest=10, has_older=True))
+        self.clock.return_value = 101.0
+        self.logic.poll()
+        self.take("sync_room")
+        self.logic.load_older()
+        self.assertEqual(self.logic.display_state, "syncing")
+        self.assertTrue(self.network.requests.empty())
+        self.reply(self.sync(newer=[self.message(15)], oldest=10, latest=15, has_older=True))
+        request = self.take("sync_room")
+        self.assertEqual((request["old_count"], request["oldest_id"], request["latest_id"]), (20, 10, 15))
+
+    # Every foreground button uses the same waiting slot. Reject duplicate
+    # clicks while the command waits and preserve the original poll context.
+    def test_all_foreground_actions_can_wait_behind_directory_poll(self):
+        self.join()
+        self.open_room(self.sync(newer=[self.message(1)], oldest=1, latest=1, has_older=True))
+        actions = [
+            (self.logic.ping, "ping", {}),
+            (lambda: self.logic.toggle_heart(1), "set_heart", {"message_id": 1, "hearted": True}),
+            (lambda: self.logic.set_pin(1), "set_pin", {"message_id": 1}),
+            (self.logic.request_summary, "request_summary", {}),
+            (self.logic.trigger_effect, "trigger_effect", {}),
+            (lambda: self.logic.create_group("Queued group"), "create_group", {"name": "Queued group"}),
+        ]
+        for invoke, action, expected in actions:
+            with self.subTest(action=action):
+                self.logic._next_directory_poll = 99
+                self.logic.poll()
+                self.take("get_directory")
+                invoke()
+                invoke()
+                self.assertTrue(self.network.requests.empty())
+                self.assertEqual(self.logic._pending_action, "get_directory")
+                self.reply({"online_users": [self.alice], "groups": []})
+                payload = self.take(action)
+                if action not in {"ping", "create_group"}:
+                    expected = {"room_key": "private:1:2", **expected}
+                self.assertEqual(payload, expected)
+                self.reply(error={"code": "SERVER_BUSY", "message": "Try later"})
+
+    # Complete a pending revision snapshot before rebuilding older-history bounds.
+    def test_queued_older_history_waits_for_revision_snapshot(self):
+        self.join()
+        self.open_room(self.sync(newer=[self.message(10)], oldest=10, latest=10, has_older=True))
+        self.clock.return_value = 101.0
+        self.logic.poll()
+        self.take("sync_room")
+        self.logic.load_older()
+        self.reply({**self.sync(oldest=10, latest=10, has_older=True),
+                    "room_revision": 1, "reload_required": True})
+        self.assertEqual(self.take("get_room_snapshot")["room_revision"], 1)
+        self.assertEqual(self.logic.display_state, "syncing")
+        self.reply({"messages": [self.message(10)], "room_revision": 1,
+                    "pinned_message": None, "has_more": False, "next_after_id": None})
+        payload = self.take("sync_room")
+        self.assertEqual((payload["old_count"], payload["latest_id"], payload["room_revision"]), (20, 10, 1))
+
+    # A room switch cancels a waiting room command instead of sending it into
+    # the old conversation or applying its eventual acknowledgement to a new one.
+    def test_room_switch_cancels_command_waiting_behind_poll(self):
+        self.join()
+        self.open_room()
+        self.clock.return_value = 101.0
+        self.logic.poll()
+        self.take("sync_room")
+        self.logic.send("Cancel on room switch")
+        self.logic.open_chat(3, "Carol")
+        self.reply(self.sync())
+        self.assertEqual(self.take("open_private"), {"target_user_id": 3})
+        self.assertIsNone(self.logic._queued_request)
+
+    # Closing or disconnecting drops waiting commands even when a late poll
+    # response is drained before the worker actually finishes shutting down.
+    def test_disconnect_cancels_waiting_command(self):
+        self.join()
+        self.open_room()
+        self.logic._next_directory_poll = 99
+        self.logic.poll()
+        self.take("get_directory")
+        self.logic.send("Do not send after disconnect")
+        self.logic.disconnect()
+        self.assertIsNone(self.logic._queued_request)
+        self.reply({"online_users": [self.alice], "groups": []})
+        self.assertTrue(self.network.requests.empty())
+        self.assertEqual(self.logic.state, "disconnecting")
+
+    # Window close cancels a queued command before draining a late poll reply.
+    def test_close_cancels_waiting_command(self):
+        self.join()
+        self.open_room()
+        self.logic._next_directory_poll = 99
+        self.logic.poll()
+        self.take("get_directory")
+        self.logic.send("Do not send after close")
+        self.logic.close()
+        self.assertIsNone(self.logic._queued_request)
+        self.reply({"online_users": [self.alice], "groups": []})
+        self.assertTrue(self.network.requests.empty())
+        self.assertEqual(self.logic.state, "closing")
 
     def test_login_directory_and_ping_are_serialized_without_stacked_polls(self):
         self.join()

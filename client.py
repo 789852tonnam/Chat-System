@@ -253,14 +253,14 @@ class ClientWindow(tk.Tk):
         self._update_message_controls()
 
     # Render selection text and action availability from the current logic state.
-    # Busy requests cannot stack mutations, but the text remains selectable/copyable.
+    # Polling permits one queued command; foreground requests prevent duplicates.
     def _update_message_controls(self) -> None:
         message = self.logic.messages.get(self._selected_message_id)
-        enabled = message is not None and self.logic.state == "connected"
+        enabled = message is not None and self.logic.display_state == "connected"
         self.heart_button.configure(state="normal" if enabled else "disabled",
                                     text="Unheart" if message and message["hearted_by_me"] else "Heart")
         self.pin_button.configure(state="normal" if enabled else "disabled")
-        self.unpin_button.configure(state="normal" if self.logic.pinned_message is not None and self.logic.state == "connected" else "disabled")
+        self.unpin_button.configure(state="normal" if self.logic.pinned_message is not None and self.logic.display_state == "connected" else "disabled")
         self.selection_title.set(f"Selected: {_sender_name(message)}: {message['content'][:35].replace(chr(10), ' ')}"
                                  if message else "Click a message to select")
 
@@ -438,10 +438,11 @@ class ClientWindow(tk.Tk):
 
     # Keep status text, button availability, and form editability in sync.
     # Only the disconnected state allows a new address or connection attempt.
+    # Routine polls keep status and controls stable; commands queue behind them.
     # Waiting disables Ping while Disconnect remains available for cancellation.
     def _render_state(self) -> None:
-        state = self.logic.state
-        self.status.set({
+        state = self.logic.display_state
+        status = {
             "waiting": "Waiting for pong...", "joining": "Joining...",
             "refreshing": "Refreshing online users...",
             "opening": "Opening conversation...", "syncing": "Loading messages...",
@@ -451,7 +452,9 @@ class ClientWindow(tk.Tk):
             "requesting_summary": "Requesting AI summary...", "checking_summary": "Checking AI summary...",
             "triggering_sound": "Requesting room sound...",
             "connected": f"Joined as {self.logic.user['username']}" if self.logic.user else "Connected",
-        }.get(state, state.capitalize()))
+        }.get(state, state.capitalize())
+        if self.status.get() != status:
+            self.status.set(status)
         self.connect_button.configure(state="normal" if state == "disconnected" else "disabled")
         self.disconnect_button.configure(
             state="normal" if state not in {"disconnected", "disconnecting", "closing"} else "disabled"

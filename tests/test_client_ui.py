@@ -213,6 +213,34 @@ class ClientUITests(unittest.TestCase):
             self.assertEqual(bob.online_users.get_children(), ())
             self.assertEqual(alice.online_users.item(alice.online_users.get_children()[0], "text"), "Alice (you)")
 
+    # Routine directory/history checks must not replace the joined status with
+    # loading text; explicit initial/older history requests still show progress.
+    def test_background_polls_keep_status_stable_without_redrawing_history(self):
+        server = self.server()
+        bob = self.raw_peer(server, "Bob")
+        window = self.window(server)
+        window.connect()
+        self.pump_until(window, lambda: window.logic.state == "connected")
+        self.open_room(window, bob.user["id"])
+        expected = "Joined as Alice"
+        window.logic._next_directory_poll = time.monotonic() - 1
+        window.logic._poll_directory()
+        self.assertEqual(window.logic.state, "refreshing")
+        self.assertEqual(window.status.get(), expected)
+        for button in (window.ping_button, window.send_button, window.create_group_button,
+                       window.summary_button, window.sound_button):
+            self.assertFalse(button.instate(["disabled"]))
+        self.pump_until(window, lambda: window.logic.state == "connected")
+        with patch.object(window, "_render_messages", wraps=window._render_messages) as render:
+            window.logic._sync_room(0)
+            self.assertEqual(window.status.get(), expected)
+            self.assertFalse(window.send_button.instate(["disabled"]))
+            self.pump_until(window, lambda: window.logic.state == "connected")
+            render.assert_not_called()
+        window.logic._sync_room(20)
+        self.assertEqual(window.status.get(), "Loading messages...")
+        self.pump_until(window, lambda: window.logic.state == "connected")
+
     def test_slow_directory_does_not_stack_polls_or_block_window_close(self):
         entered = threading.Event()
         release = threading.Event()
@@ -229,7 +257,7 @@ class ClientUITests(unittest.TestCase):
             window.connect()
             self.pump_until(window, entered.is_set)
             self.assertEqual(window.logic.state, "refreshing")
-            self.assertTrue(window.ping_button.instate(["disabled"]))
+            self.assertFalse(window.ping_button.instate(["disabled"]))
             window.logic._next_directory_poll = time.monotonic() - 1
             for _ in range(3):
                 window.logic._poll_directory()
@@ -242,9 +270,58 @@ class ClientUITests(unittest.TestCase):
         finally:
             release.set()
 
+    # A delayed poll leaves real buttons enabled. Clicking Send waits without
+    # blocking Tk, then dispatches exactly once after the poll response arrives.
+    def test_send_button_queues_behind_slow_room_poll(self):
+        entered, release = threading.Event(), threading.Event()
+
+        class SlowPollServer(ChatServer):
+            pause = False
+
+            def _handle_request(self, request, session):
+                if request.action == "sync_room" and self.pause:
+                    self.pause = False
+                    entered.set()
+                    release.wait(3)
+                return super()._handle_request(request, session)
+
+        server = self.server(SlowPollServer)
+        alice, bob = self.raw_peer(server, "Alice"), self.raw_peer(server, "Bob")
+        room = alice.ok("open_private", {"target_user_id": bob.user["id"]})["room"]["room_key"]
+        for index in range(21):
+            alice.ok("send_message", {"room_key": room, "content": f"History {index}"})
+        window = self.window(server)
+        window.connect()
+        self.open_room(window, bob.user["id"])
+        window._select_message(window.logic.latest_id)
+        window.message_input.insert("1.0", "Sent during poll")
+        server.pause = True
+        window.logic._next_room_poll = time.monotonic() - 1
+        try:
+            self.pump_until(window, entered.is_set)
+            for button in (window.ping_button, window.send_button, window.heart_button,
+                           window.pin_button, window.older_button, window.summary_button,
+                           window.sound_button, window.create_group_button):
+                self.assertFalse(button.instate(["disabled"]))
+            self.assertEqual(window.status.get(), "Joined as Alice")
+            window.send_button.invoke()
+            self.assertEqual(window.logic._pending_action, "sync_room")
+            self.assertEqual(window.logic.display_state, "sending")
+            self.assertTrue(window.logic.network.requests.empty())
+            self.assertTrue(window.send_button.instate(["disabled"]))
+            heartbeat = threading.Event()
+            window.after(10, heartbeat.set)
+            self.pump_until(window, heartbeat.is_set)
+            release.set()
+            self.pump_until(window, lambda: window.message_input.get("1.0", "end-1c") == ""
+                            and len(window.logic.messages) == 21)
+            self.assertEqual(sum(message["content"] == "Sent during poll"
+                                 for message in window.logic.messages.values()), 1)
+        finally:
+            release.set()
+
     def test_two_windows_exchange_private_messages_without_duplicates(self):
-        # Keep both shortened intervals above the 50 ms UI queue tick so an idle
-        # button state remains observable while directory and room polls alternate.
+        # Shortened intervals exercise alternating directory and room polls.
         with patch("client_logic.DIRECTORY_POLL_INTERVAL", 0.2), patch("client_logic.ROOM_POLL_INTERVAL", 0.1):
             server = self.server()
             alice, bob = self.window(server), self.window(server, "Bob")

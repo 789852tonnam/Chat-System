@@ -2,7 +2,7 @@
 
 A Computer Network term project using Python, Tkinter, and TCP sockets. The planned application includes private chats, group chats, and four additional features.
 
-**Current status:** The server and Tkinter client support username-only entry, persistent user IDs, a live online directory, private and group chat with persistent history, message hearts, a single room pin, AI summaries, room sound playback, connection management, and ping. All 190 tests passed, including SQLite persistence, real TCP loopback, and Tkinter UI tests. Docker images and the two-physical-computer demonstration remain pending.
+**Current status:** The server and Tkinter client support username-only entry, persistent user IDs, a live online directory, private and group chat with persistent history, message hearts, a single room pin, AI summaries, room sound playback, connection management, and ping. All 200 tests passed, including SQLite persistence, real TCP loopback, and Tkinter UI tests. Docker images and the two-physical-computer demonstration remain pending.
 
 ## Run the server
 
@@ -30,7 +30,7 @@ Enter a username, select **Join**, then **Send Ping**, and check Activity for th
 
 `client.py` owns widgets, input reading, rendering and scrolling. `client_logic.py` owns validation, connection/login state, room/message data, history cursors, request ordering and polling. UI and logic run on the same main thread: button callbacks pass plain values to logic, and logic emits synchronous display events. `client_network.py` owns the existing socket thread and exchanges requests/results with logic through queues. Logic and network never import Tkinter, and the UI never performs socket I/O. Both client and server receive data with `recv()` and assemble complete JSON lines with `LineFramer`.
 
-The online list includes your own name, marked `(you)`, and shows each user once even when that identity has multiple connections. It refreshes immediately after Join, then every 3 seconds after a snapshot returns. Polls wait for any request already in flight and never accumulate. While refreshing, Ping is temporarily disabled; Disconnect and window close remain available. Selection is preserved for users who remain online.
+The online list includes your own name, marked `(you)`, and shows each user once even when that identity has multiple connections. It refreshes immediately after Join, then every 3 seconds after a snapshot returns. Polls wait for any request already in flight and never accumulate. During background refreshes, action buttons stay available; one clicked command waits for the current response, then runs before further polling. Disconnect and window close remain available. Selection is preserved for users who remain online.
 
 Logging out or closing the last connection removes that user from later snapshots. Disconnected sessions are removed by the server worker before requests and during idle maintenance; stored users remain in SQLite. Background polling keeps healthy idle clients active. If a connection fails, the client reports the error and clears the online list. Reconnect explicitly with **Join**. Requests are never retried automatically.
 
@@ -41,6 +41,8 @@ See the local [Client guide](docs/client.md) for details. The `docs/`, `diagram/
 Select another online user and choose **Open Chat**. Type a message and choose **Send**, or press **Ctrl-Enter**. Enter inserts a newline. Both participants open the same private room; the server checks membership for every read and send. A third user cannot access that room by supplying its key.
 
 Opening a room loads its latest 20 messages. **Load older (20)** fetches the next older batch. The active room polls every second, with one request in flight across directory, history, and user actions. Messages use global increasing IDs, so room histories may contain gaps. Catch-up batches are limited to 100 messages and continue from the last delivered ID.
+
+Background directory, room and AI-status polls retain the joined status instead of flashing loading text. Initial room history and explicitly requested older history still show loading progress. Action buttons retain their idle availability during polling. Once a command is accepted, controls show its busy state to prevent repeated clicks. Switching rooms or disconnecting cancels a waiting command. Older-history requests build fresh cursors after any pending poll or revision snapshot completes. Unchanged room polls do not redraw history.
 
 Only the active room is cached in client memory. Switching rooms clears that cache, fetches history again, and ignores replies belonging to an earlier room generation. Send acknowledgements do not append messages or advance the history cursor; the next sync supplies the complete ordered update. A send error retains the input for correction. Private messages remain stored when the other participant is offline, and rooms, memberships, and messages survive a server restart using the same database.
 
