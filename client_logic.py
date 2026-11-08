@@ -15,6 +15,7 @@ from common.protocol import ProtocolError, validate_content, validate_group_name
 DIRECTORY_POLL_INTERVAL = 3.0
 # Only the active room is polled and retained in memory.
 ROOM_POLL_INTERVAL = 1.0
+SUMMARY_POLL_INTERVAL = 3.0
 
 
 class ClientLogic:
@@ -49,6 +50,10 @@ class ClientLogic:
         self._next_directory_poll: float | None = None
         # Exactly one application request is outstanding on the connection.
         self._pending_action: str | None = None
+        # Captures the room/job context even if the user switches before a reply.
+        self._pending_payload: dict = {}
+        # Only this client's requested jobs are polled; results still arrive via sync.
+        self._summary_jobs: dict[str, dict] = {}
         # Room generation captured when the outstanding request was sent.
         self._pending_generation = 0
         # Incremented on room clear/switch to reject replies for earlier rooms.
@@ -116,6 +121,7 @@ class ClientLogic:
     # Only this main-thread logic changes application request bookkeeping.
     def _request(self, action: str, payload: dict, state: str) -> None:
         self._pending_action = action
+        self._pending_payload = payload
         self._pending_generation = self._room_generation
         self._set_state(state)
         self.network.requests.put((action, payload))
@@ -193,6 +199,31 @@ class ClientLogic:
         if self.room is None or self.state != "connected" or (message_id is not None and message_id not in self.messages):
             return
         self._request("set_pin", {"room_key": self.room["room_key"], "message_id": message_id}, "updating")
+
+    # Start an independent job; the acknowledgement does not wait for the provider.
+    # Another summary can be requested while earlier jobs run in the background.
+    def request_summary(self) -> None:
+        if self.room is not None and self.state == "connected":
+            self._request("request_summary", {"room_key": self.room["room_key"]}, "requesting_summary")
+
+    # Keep status notices scoped to their room; successful text is received by sync.
+    def _apply_summary_status(self, job: dict) -> None:
+        tracked = self._summary_jobs.get(job["job_id"])
+        if tracked is None:
+            return
+        if job["room_key"] != tracked["room_key"]:
+            del self._summary_jobs[job["job_id"]]
+            return
+        if job["state"] == "running":
+            tracked["next_poll"] = time.monotonic() + SUMMARY_POLL_INTERVAL
+            return
+        del self._summary_jobs[job["job_id"]]
+        if self.room is not None and self.room["room_key"] == job["room_key"]:
+            if job["state"] == "succeeded":
+                self._emit("log", "AI summary saved in this conversation.")
+                self._next_room_poll = time.monotonic()
+            else:
+                self._emit("log", f"{job['error']['code']}: {job['error']['message']}")
 
     # Include both history bounds; an initial open uses null cursors and twenty.
     def _sync_room(self, old_count: int) -> None:
@@ -292,8 +323,31 @@ class ClientLogic:
     # Definite errors preserve input; only a successful send clears the composer.
     def _handle_response(self, response: dict) -> None:
         action, generation = self._pending_action, self._pending_generation
+        payload = self._pending_payload
+        self._pending_payload = {}
         self._pending_action = None
         if self.state in {"disconnecting", "closing"}:
+            return
+        if action == "request_summary":
+            room_key = payload["room_key"]
+            if response["ok"]:
+                self._summary_jobs[response["data"]["job_id"]] = {"room_key": room_key, "next_poll": time.monotonic() + SUMMARY_POLL_INTERVAL}
+                if self.room is not None and self.room["room_key"] == room_key:
+                    self._emit("log", "AI summary requested; you can continue chatting.")
+            elif self.room is not None and self.room["room_key"] == room_key:
+                self._emit("log", f"{response['error']['code']}: {response['error']['message']}")
+            self._set_state("connected")
+            return
+        if action == "get_summary_status" and not response["ok"]:
+            tracked = self._summary_jobs.get(payload["job_id"])
+            if tracked is not None:
+                if response["error"]["code"] == "SERVER_BUSY":
+                    tracked["next_poll"] = time.monotonic() + SUMMARY_POLL_INTERVAL
+                else:
+                    del self._summary_jobs[payload["job_id"]]
+                    if self.room is not None and self.room["room_key"] == tracked["room_key"]:
+                        self._emit("log", f"{response['error']['code']}: {response['error']['message']}")
+            self._set_state("connected")
             return
         # Mutations still refresh discovery even when their room was superseded.
         if action in {"create_group", "join_group"} and response["ok"]:
@@ -357,6 +411,8 @@ class ClientLogic:
                 self._apply_snapshot(data)
             elif action in {"set_heart", "set_pin"}:
                 self._next_room_poll = time.monotonic()
+            elif action == "get_summary_status":
+                self._apply_summary_status(data["job"])
             else:
                 self._emit("log", f"Response #{response['request_id']}: {data}")
         self._set_state("connected")
@@ -378,6 +434,11 @@ class ClientLogic:
             elif (self.state == "connected" and self.room is not None and self._next_room_poll is not None
                     and time.monotonic() >= self._next_room_poll):
                 self._sync_room(20 if self.latest_id is None else 0)
+            elif self.state == "connected":
+                for job_id, job in self._summary_jobs.items():
+                    if time.monotonic() >= job["next_poll"]:
+                        self._request("get_summary_status", {"job_id": job_id}, "checking_summary")
+                        break
 
     # Drain network events without waiting; the window calls this on its main thread.
     # Check completion before draining so final responses are not lost, then join
@@ -404,6 +465,8 @@ class ClientLogic:
                 self.user = None
                 self.groups.clear()
                 self._pending_action = None
+                self._pending_payload = {}
+                self._summary_jobs.clear()
                 self._clear_room()
                 self._next_directory_poll = None
                 self._emit("directory", {"online_users": [], "groups": []})

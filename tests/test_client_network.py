@@ -340,3 +340,46 @@ class ClientNetworkTests(unittest.TestCase):
                     self.assertTrue(self.event(client, "error"))
                     self.event(client, "disconnected")
                     self.stop_client(client)
+
+    def test_invalid_summary_ack_status_or_ai_message_closes_connection(self):
+        from server_ai import AIConfig
+        for broken in ("ack", "status", "message"):
+            with self.subTest(broken=broken), patch("server.generate_summary", return_value=("Summary", "actual-model")):
+                class InvalidSummaryServer(ChatServer):
+                    def __init__(self, config):
+                        super().__init__(config, ai_config=AIConfig("https://provider.example/v1", "test-model", "dummy"))
+                    def _handle_request(self, request, session):
+                        response = super()._handle_request(request, session)
+                        if response["ok"]:
+                            if broken == "ack" and request.action == "request_summary":
+                                response["data"]["job_id"] = "bad"
+                            elif broken == "status" and request.action == "get_summary_status":
+                                response["data"]["job"]["job_id"] = "bad"
+                            elif broken == "message" and request.action == "sync_room":
+                                for message in response["data"]["older_messages"]:
+                                    if message["sender_kind"] == "ai":
+                                        message["sender"] = session.user
+                        return response
+                server = self.server(InvalidSummaryServer)
+                with ChatPeer(server.address, "Bob") as bob:
+                    client = self.client(server)
+                    client.requests.put(("login", {"username": "Alice"}))
+                    alice = self.event(client, "response")["data"]["user"]
+                    key = bob.ok("open_private", {"target_user_id": alice["id"]})["room"]["room_key"]
+                    bob.ok("send_message", {"room_key": key, "content": "Hello"})
+                    client.requests.put(("request_summary", {"room_key": key}))
+                    if broken != "ack":
+                        job_id = self.event(client, "response")["data"]["job_id"]
+                        if broken == "status":
+                            client.requests.put(("get_summary_status", {"job_id": job_id}))
+                        else:
+                            deadline = time.monotonic() + 2
+                            # Bob's response is deliberately corrupted too; inspect kind only.
+                            while time.monotonic() < deadline:
+                                if any(message["sender_kind"] == "ai" for message in bob.ok("sync_room", initial_sync(key))["older_messages"]):
+                                    break
+                                time.sleep(0.01)
+                            client.requests.put(("sync_room", initial_sync(key)))
+                    self.assertTrue(self.event(client, "error"))
+                    self.event(client, "disconnected")
+                    self.stop_client(client)

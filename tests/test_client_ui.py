@@ -492,3 +492,64 @@ class ClientUITests(unittest.TestCase):
         for widget in (window.pin_frame, window.unpin_button, window.heart_button, window.pin_button, window.send_button):
             bottom = widget.winfo_rooty() - window.winfo_rooty() + widget.winfo_height()
             self.assertLessEqual(bottom, window.winfo_height())
+
+    def test_summary_jobs_keep_chat_responsive_and_both_windows_receive_ai_messages(self):
+        from server_ai import AIConfig
+        started = [threading.Event(), threading.Event()]
+        release = threading.Event()
+        lock = threading.Lock()
+        calls = []
+        def generate(config, source):
+            with lock:
+                index = len(calls)
+                calls.append(source)
+            started[index].set()
+            release.wait(5)
+            return f"Mocked summary {index + 1}", "actual-model"
+        class AIServer(ChatServer):
+            def __init__(self, config):
+                super().__init__(config, ai_config=AIConfig("https://provider.example/v1", "test-model", "dummy"))
+        with patch("server.generate_summary", side_effect=generate), patch("client_logic.DIRECTORY_POLL_INTERVAL", 0.3), \
+                patch("client_logic.ROOM_POLL_INTERVAL", 0.15), patch("client_logic.SUMMARY_POLL_INTERVAL", 0.4):
+            server = self.server(AIServer)
+            raw_alice, raw_bob = self.raw_peer(server, "Alice"), self.raw_peer(server, "Bob")
+            key = raw_alice.ok("open_private", {"target_user_id": raw_bob.user["id"]})["room"]["room_key"]
+            raw_alice.ok("send_message", {"room_key": key, "content": "Please plan the meeting"})
+            alice, bob = self.window(server), self.window(server, "Bob")
+            alice.connect()
+            bob.connect()
+            self.open_room(alice, raw_bob.user["id"])
+            self.open_room(bob, raw_alice.user["id"])
+            try:
+                for index in range(2):
+                    self.pump_until(alice, lambda: not alice.summary_button.instate(["disabled"]))
+                    alice.summary_button.invoke()
+                    self.pump_until(alice, started[index].is_set)
+                raw_bob.ok("send_message", {"room_key": key, "content": "While AI runs"})
+                self.pump_until(alice, lambda: len(alice.logic.messages) == 2 and len(bob.logic.messages) == 2)
+            finally:
+                release.set()
+            self.pump_until(alice, lambda: sum(m["sender_kind"] == "ai" for m in alice.logic.messages.values()) == 2
+                            and sum(m["sender_kind"] == "ai" for m in bob.logic.messages.values()) == 2)
+            self.assertIn("AI: Mocked summary", alice.chat.get("1.0", "end"))
+            ai = next(m for m in alice.logic.messages.values() if m["sender_kind"] == "ai")
+            self.assertIsNone(ai["sender"])
+            self.assertEqual(ai["ai"]["model"], "actual-model")
+            alice._select_message(ai["id"])
+            self.pump_until(alice, lambda: not alice.heart_button.instate(["disabled"]))
+            alice.heart_button.invoke()
+            self.pump_until(bob, lambda: bob.logic.messages[ai["id"]]["heart_count"] == 1)
+            self.pump_until(alice, lambda: not alice.pin_button.instate(["disabled"]))
+            alice.pin_button.invoke()
+            self.pump_until(bob, lambda: bob.logic.pinned_message is not None)
+            self.assertIn("Pinned - AI:", bob.pin_text.get("1.0", "end"))
+            alice.deiconify()
+            alice.geometry("880x600")
+            alice.update_idletasks()
+            for widget in (alice.summary_button, alice.heart_button, alice.pin_button, alice.unpin_button, alice.send_button):
+                x = widget.winfo_rootx() - alice.winfo_rootx()
+                y = widget.winfo_rooty() - alice.winfo_rooty()
+                self.assertGreaterEqual(x, 0)
+                self.assertGreaterEqual(y, 0)
+                self.assertLessEqual(x + widget.winfo_width(), alice.winfo_width())
+                self.assertLessEqual(y + widget.winfo_height(), alice.winfo_height())

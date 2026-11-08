@@ -8,7 +8,10 @@ import math
 import queue
 import sqlite3
 import threading
+import time
+import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 from common.protocol import (
@@ -20,19 +23,24 @@ from common.protocol import (
     validate_content,
     validate_group_name,
     validate_id,
+    validate_job_id,
     validate_room_key,
     validate_snapshot_request,
     validate_sync_request,
     validate_username,
 )
 from server_network import ClientSession, ServerNetwork
+from server_ai import AIConfig, generate_summary, load_ai_config
 from database import (
     create_group, get_or_create_user, get_room_snapshot, join_group, list_groups,
-    open_database, open_private, send_message, set_heart, set_pin, sync_room,
+    open_database, open_private, require_room, save_summary, send_message,
+    set_heart, set_pin, summary_source, sync_room,
 )
 
 LOGGER = logging.getLogger("socket_chat.server")
 _STOP = object()
+JOB_TIMEOUT = 60.0
+JOB_RETENTION = 3600.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,16 +80,27 @@ class WorkItem:
     response: dict[str, Any] | None = None
 
 
+# API threads enqueue immutable completions instead of changing jobs or SQLite.
+@dataclass(frozen=True, slots=True)
+class SummaryCompletion:
+    # Identifies the worker-owned status record.
+    job_id: str
+    # Validated summary text and actual model, never credentials.
+    result: tuple[str, str] | None = None
+    # Fixed public failure fields; no upstream body or exception text.
+    error: dict | None = None
+
+
 class ChatServer:
     """Single-use server with explicit start/stop for CLI and TCP integration tests."""
 
     # Prepare application state and connect the transport to _submit().
     # Construction opens no sockets or database; start() owns that lifecycle.
-    def __init__(self, config: ServerConfig | None = None):
+    def __init__(self, config: ServerConfig | None = None, *, ai_config: AIConfig | None = None):
         # Shared configuration validated before any resources are allocated.
         self.config = config or ServerConfig()
         # I/O enqueues WorkItems; only the application worker handles them.
-        self._work: queue.Queue[WorkItem | object] = queue.Queue(self.config.queue_capacity)
+        self._work: queue.Queue[WorkItem | SummaryCompletion | object] = queue.Queue(self.config.queue_capacity)
         # Shared cancellation wakes wait(), transport and queued response waits.
         self._stopping = threading.Event()
         # Prevents overlapping application startup and shutdown.
@@ -104,6 +123,12 @@ class ChatServer:
         self._database: sqlite3.Connection | None = None
         # Worker-owned logins; several connections can share the same user ID.
         self._sessions: set[ClientSession] = set()
+        # Loaded by CLI only; tests/programmatic callers supply explicit fake config.
+        self._ai_config = ai_config
+        # Worker-owned transient job statuses; credentials never enter these records.
+        self._summary_jobs: dict[str, dict] = {}
+        # Worker tracks API threads; they never access SQLite or mutate job state.
+        self._ai_threads: set[threading.Thread] = set()
         # Each instance is single-use, including after failed startup.
         self._started = False
         # Makes repeated stop() calls harmless.
@@ -187,7 +212,7 @@ class ChatServer:
     # Own SQLite on this thread from initialization through final close.
     # Report startup failure before accepting clients, and always mark dequeued
     # items complete; the stop sentinel ends the loop.
-    # Idle queue timeouts leave room for future maintenance work on this thread.
+    # Idle ticks prune sessions and enforce AI deadlines/status retention.
     def _worker_loop(self) -> None:
         try:
             self._database = open_database(self.config.database_path)
@@ -202,10 +227,15 @@ class ChatServer:
                     item = self._work.get(timeout=1.0)
                 except queue.Empty:
                     self._prune_sessions()
+                    self._maintain_summary_jobs()
                     continue
                 try:
                     if item is _STOP:
                         return
+                    self._maintain_summary_jobs()
+                    if isinstance(item, SummaryCompletion):
+                        self._finish_summary(item)
+                        continue
                     assert isinstance(item, WorkItem)
                     try:
                         self._prune_sessions()
@@ -223,6 +253,7 @@ class ChatServer:
                     self._work.task_done()
         finally:
             self._sessions.clear()
+            self._summary_jobs.clear()
             self._database.close()
             self._database = None
 
@@ -231,6 +262,86 @@ class ChatServer:
     # Persistent users stay in SQLite; this only changes online visibility.
     def _prune_sessions(self) -> None:
         self._sessions = {session for session in self._sessions if not session.closed.is_set()}
+
+    # Accept one independent job after membership/config/source checks on the worker.
+    # Only detached human text crosses to the API thread; acknowledge without waiting.
+    def _request_summary(self, room_key: str, user_id: int) -> dict:
+        require_room(self._database, room_key, user_id)
+        if self._ai_config is None:
+            raise ProtocolError("AI_NOT_CONFIGURED", "AI summaries are not configured on the server")
+        messages = summary_source(self._database, room_key, user_id)
+        if not messages:
+            raise ProtocolError("NO_HUMAN_MESSAGES", "No human messages to summarize")
+        job_id = str(uuid.uuid4())
+        job = {"job_id": job_id, "room_key": room_key, "state": "running",
+               "created_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+               "completed_at": None, "result_message_id": None, "error": None,
+               "_user_id": user_id, "_source_id": messages[-1]["id"],
+               "_deadline": time.monotonic() + JOB_TIMEOUT, "_finished": None}
+        self._summary_jobs[job_id] = job
+        # shortcut: urllib cannot cancel in-flight HTTPS; daemon threads drop results
+        # on shutdown and finish on network timeout. Upgrade if strict cancellation is needed.
+        thread = threading.Thread(target=self._run_summary, args=(job_id, messages), name=f"chat-ai-{job_id}", daemon=True)
+        self._ai_threads.add(thread)
+        try:
+            thread.start()
+        except RuntimeError:
+            self._ai_threads.discard(thread)
+            del self._summary_jobs[job_id]
+            raise ProtocolError("AI_UNAVAILABLE", "Could not start the summary request") from None
+        return {"job_id": job_id, "state": "running"}
+
+    # Run on one API thread. Return only validated output or fixed public errors.
+    # Completion uses the central bounded queue, retrying queue insertion only.
+    def _run_summary(self, job_id: str, messages: list[dict]) -> None:
+        if self._stopping.is_set():
+            return
+        try:
+            result = generate_summary(self._ai_config, messages)
+            completion = SummaryCompletion(job_id, result=result)
+        except ProtocolError as exc:
+            completion = SummaryCompletion(job_id, error={"code": exc.code, "message": exc.message, **(exc.details or {})})
+        except Exception:
+            completion = SummaryCompletion(job_id, error={"code": "AI_FAILED", "message": "AI summary failed"})
+        while not self._stopping.is_set():
+            try:
+                self._work.put(completion, timeout=0.2)
+                return
+            except queue.Full:
+                continue
+
+    # Complete a job on the worker only; finished/deadline-expired jobs ignore late
+    # or duplicate results. The database also enforces one message per summary job.
+    def _finish_summary(self, completion: SummaryCompletion) -> None:
+        job = self._summary_jobs.get(completion.job_id)
+        if job is None or job["state"] != "running":
+            return
+        error = completion.error
+        message_id = None
+        if error is None:
+            try:
+                content, model = completion.result
+                message_id = save_summary(self._database, job["room_key"], content, model, job["job_id"], job["_source_id"])
+            except Exception:
+                error = {"code": "AI_FAILED", "message": "Could not save the AI summary"}
+        self._end_summary(job, message_id, error)
+
+    # Record a terminal status without creating an error message in the room.
+    def _end_summary(self, job: dict, message_id: int | None, error: dict | None) -> None:
+        job.update(state="failed" if error else "succeeded", result_message_id=message_id, error=error,
+                   completed_at=datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+                   _finished=time.monotonic())
+
+    # Enforce deadlines during idle ticks and before requests/completions. Expire
+    # terminal statuses after an hour; persisted AI messages are never removed here.
+    def _maintain_summary_jobs(self) -> None:
+        now = time.monotonic()
+        for job_id, job in list(self._summary_jobs.items()):
+            if job["state"] == "running" and now >= job["_deadline"]:
+                self._end_summary(job, None, {"code": "AI_TIMEOUT", "message": "AI summary deadline exceeded"})
+            elif job["_finished"] is not None and now - job["_finished"] >= JOB_RETENTION:
+                del self._summary_jobs[job_id]
+        self._ai_threads = {thread for thread in self._ai_threads if thread.is_alive()}
 
     # Dispatch an application request on the worker thread; do not send socket data.
     # Unknown names return UNKNOWN_ACTION; known but unfinished actions explicitly
@@ -243,7 +354,7 @@ class ChatServer:
             return error_response(request.request_id, "UNKNOWN_ACTION", "Unknown action")
         if request.action not in {"ping", "login", "logout", "get_directory", "open_private",
                                   "create_group", "join_group", "send_message", "sync_room",
-                                  "get_room_snapshot", "set_heart", "set_pin"}:
+                                  "get_room_snapshot", "set_heart", "set_pin", "request_summary", "get_summary_status"}:
             return error_response(
                 request.request_id,
                 "ACTION_NOT_IMPLEMENTED",
@@ -298,6 +409,20 @@ class ChatServer:
         if request.action == "get_room_snapshot":
             validate_snapshot_request(request.payload)
             return success_response(request.request_id, get_room_snapshot(self._database, session.user["id"], request.payload))
+        if request.action == "request_summary":
+            if set(request.payload) != {"room_key"}:
+                raise ProtocolError("INVALID_PAYLOAD", "request_summary requires only room_key")
+            room_key = validate_room_key(request.payload["room_key"])
+            return success_response(request.request_id, self._request_summary(room_key, session.user["id"]))
+        if request.action == "get_summary_status":
+            if set(request.payload) != {"job_id"}:
+                raise ProtocolError("INVALID_PAYLOAD", "get_summary_status requires only job_id")
+            job_id = validate_job_id(request.payload["job_id"])
+            job = self._summary_jobs.get(job_id)
+            if job is None or job["_user_id"] != session.user["id"]:
+                raise ProtocolError("SUMMARY_JOB_NOT_FOUND", "Summary job not found")
+            require_room(self._database, job["room_key"], session.user["id"])
+            return success_response(request.request_id, {"job": {name: value for name, value in job.items() if not name.startswith("_")}})
         if request.action in {"set_heart", "set_pin"}:
             expected = {"room_key", "message_id", "hearted"} if request.action == "set_heart" else {"room_key", "message_id"}
             if set(request.payload) != expected:
@@ -329,7 +454,7 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     server = None
     try:
-        server = ChatServer(ServerConfig(host=args.host, port=args.port, database_path=args.database))
+        server = ChatServer(ServerConfig(host=args.host, port=args.port, database_path=args.database), ai_config=load_ai_config())
         server.start()
         LOGGER.info("Listening on %s:%s", *server.address)
         server.wait()

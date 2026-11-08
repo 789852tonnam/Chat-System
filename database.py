@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from common.protocol import ProtocolError
+from common.protocol import ProtocolError, validate_content, validate_job_id, validate_model_id
 
 
 # Open storage and create only the tables implemented by the current milestone.
@@ -45,8 +45,8 @@ def open_database(path: str) -> sqlite3.Connection:
                 );
                 CREATE TABLE IF NOT EXISTS messages (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    room_key TEXT NOT NULL,
-                    sender_user_id INTEGER NOT NULL,
+                    room_key TEXT NOT NULL REFERENCES rooms(room_key),
+                    sender_user_id INTEGER,
                     content TEXT NOT NULL CHECK(length(content) BETWEEN 1 AND 4000),
                     created_at TEXT NOT NULL,
                     FOREIGN KEY(room_key, sender_user_id)
@@ -64,10 +64,55 @@ def open_database(path: str) -> sqlite3.Connection:
             columns = {row["name"] for row in connection.execute("PRAGMA table_info(rooms)")}
             if "pinned_message_id" not in columns:
                 connection.execute("ALTER TABLE rooms ADD COLUMN pinned_message_id INTEGER REFERENCES messages(id)")
+        _upgrade_ai_messages(connection)
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS message_ai (
+                message_id INTEGER PRIMARY KEY REFERENCES messages(id),
+                model TEXT NOT NULL,
+                summary_job_id TEXT NOT NULL UNIQUE,
+                source_last_message_id INTEGER NOT NULL REFERENCES messages(id)
+            )
+        """)
     except Exception:
         connection.close()
         raise
     return connection
+
+
+# SQLite cannot remove NOT NULL with ALTER COLUMN. Rebuild only older messages
+# tables, preserving IDs, the AUTOINCREMENT high-water mark and referencing rows.
+# Foreign keys are disabled outside the transaction and checked before commit.
+def _upgrade_ai_messages(connection: sqlite3.Connection) -> None:
+    columns = {row["name"]: row for row in connection.execute("PRAGMA table_info(messages)")}
+    if not columns["sender_user_id"]["notnull"]:
+        return
+    sequence = connection.execute("SELECT seq FROM sqlite_sequence WHERE name = 'messages'").fetchone()
+    connection.execute("PRAGMA foreign_keys = OFF")
+    try:
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("""
+                CREATE TABLE messages_upgrade (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    room_key TEXT NOT NULL REFERENCES rooms(room_key),
+                    sender_user_id INTEGER,
+                    content TEXT NOT NULL CHECK(length(content) BETWEEN 1 AND 4000),
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(room_key, sender_user_id) REFERENCES room_members(room_key, user_id)
+                )
+            """)
+            connection.execute("INSERT INTO messages_upgrade SELECT id,room_key,sender_user_id,content,created_at FROM messages")
+            connection.execute("DROP TABLE messages")
+            connection.execute("ALTER TABLE messages_upgrade RENAME TO messages")
+            connection.execute("CREATE INDEX messages_room_id ON messages(room_key, id)")
+            if sequence is not None:
+                changed = connection.execute("UPDATE sqlite_sequence SET seq = MAX(seq, ?) WHERE name = 'messages'", (sequence[0],)).rowcount
+                if not changed:
+                    connection.execute("INSERT INTO sqlite_sequence(name,seq) VALUES ('messages',?)", (sequence[0],))
+            if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                raise sqlite3.IntegrityError("Message upgrade failed foreign-key validation")
+    finally:
+        connection.execute("PRAGMA foreign_keys = ON")
 
 
 # Return the existing identity for a validated name, or create it atomically.
@@ -190,19 +235,48 @@ def _messages(connection: sqlite3.Connection, room_key: str, boundary: str,
               parameters: tuple, *, user_id: int, descending: bool = False, limit: int = 100) -> list[dict]:
     order = "DESC" if descending else "ASC"
     rows = connection.execute(
-        "SELECT m.*, u.username, "
+        "SELECT m.*, u.username, a.model, a.summary_job_id, a.source_last_message_id, "
         "(SELECT COUNT(*) FROM message_hearts h WHERE h.message_id = m.id) AS heart_count, "
         "EXISTS(SELECT 1 FROM message_hearts h WHERE h.message_id = m.id AND h.user_id = ?) AS hearted_by_me "
-        "FROM messages m JOIN users u ON u.id = m.sender_user_id "
+        "FROM messages m LEFT JOIN users u ON u.id = m.sender_user_id "
+        "LEFT JOIN message_ai a ON a.message_id = m.id "
         f"WHERE m.room_key = ? {boundary} ORDER BY m.id {order} LIMIT ?",
         (user_id, room_key, *parameters, limit),
     ).fetchall()
     if descending:
         rows.reverse()
-    return [{"id": row["id"], "room_key": row["room_key"], "sender_kind": "human",
-             "sender": {"id": row["sender_user_id"], "username": row["username"]},
+    return [{"id": row["id"], "room_key": row["room_key"], "sender_kind": "human" if row["sender_user_id"] is not None else "ai",
+             "sender": {"id": row["sender_user_id"], "username": row["username"]} if row["sender_user_id"] is not None else None,
              "content": row["content"], "created_at": row["created_at"],
-             "heart_count": row["heart_count"], "hearted_by_me": bool(row["hearted_by_me"]), "ai": None} for row in rows]
+             "heart_count": row["heart_count"], "hearted_by_me": bool(row["hearted_by_me"]),
+             "ai": {"model": row["model"], "summary_job_id": row["summary_job_id"],
+                    "source_last_message_id": row["source_last_message_id"]} if row["model"] is not None else None} for row in rows]
+
+
+# Copy only the latest fifty human messages in chronological order for an API job.
+# The returned data is detached from SQLite and contains no previous AI output.
+def summary_source(connection: sqlite3.Connection, room_key: str, user_id: int) -> list[dict]:
+    require_room(connection, room_key, user_id)
+    return _messages(connection, room_key, "AND m.sender_user_id IS NOT NULL", (), user_id=user_id, descending=True, limit=50)
+
+
+# Persist AI text/actual model/source boundary together, at most once per job.
+# No synthetic human account is created; AI messages have a null sender ID.
+def save_summary(connection: sqlite3.Connection, room_key: str, content: str,
+                 model: str, job_id: str, source_last_message_id: int) -> int:
+    content = validate_content(content)
+    validate_model_id(model)
+    validate_job_id(job_id)
+    source = connection.execute("SELECT room_key, sender_user_id FROM messages WHERE id = ?", (source_last_message_id,)).fetchone()
+    if source is None or source["room_key"] != room_key or source["sender_user_id"] is None:
+        raise ValueError("Summary source must be a human message in the same room")
+    with connection:
+        message_id = connection.execute(
+            "INSERT INTO messages(room_key,sender_user_id,content,created_at) VALUES (?,NULL,?,?)",
+            (room_key, content, _timestamp()),
+        ).lastrowid
+        connection.execute("INSERT INTO message_ai VALUES (?,?,?,?)", (message_id, model, job_id, source_last_message_id))
+    return message_id
 
 
 # Resolve a message after room authorization, distinguishing missing/wrong-room IDs.

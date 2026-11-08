@@ -2,7 +2,7 @@
 
 A Computer Network term project using Python, Tkinter, and TCP sockets. The planned application includes private chats, group chats, and four additional features.
 
-**Current status:** The server and Tkinter client support username-only entry, persistent user IDs, a live online directory, private and group chat with persistent history, message hearts, a single room pin, connection management, and ping. All 146 tests passed, including SQLite persistence, real TCP loopback, and Tkinter UI tests. AI, sound playback, and Docker images are not implemented yet.
+**Current status:** The server and Tkinter client support username-only entry, persistent user IDs, a live online directory, private and group chat with persistent history, message hearts, a single room pin, AI summaries, connection management, and ping. All 168 tests passed, including SQLite persistence, real TCP loopback, and Tkinter UI tests. Sound playback and Docker images are not implemented yet.
 
 ## Run the server
 
@@ -16,7 +16,7 @@ The server creates `data/chat.sqlite3` for persistent users. Choose another file
 
 Press Ctrl-C to stop the server. For LAN connections, bind the server to `0.0.0.0` and allow access to its TCP port. See the local [Server guide](docs/server.md) for ping examples and the thread/queue flow.
 
-For the planned AI integration, [.env.example](.env.example) shows sample endpoint, model and API-key values. Copy it to `.env` and replace the placeholder key. `.env` is ignored by Git. The current server does not load this configuration yet.
+For AI summaries, copy [.env.example](.env.example) to `.env` beside `server.py` and fill `OPENAI_BASE_URL`, `OPENAI_MODEL` and `OPENAI_API_KEY`. These names configure an OpenAI-compatible API; OpenRouter is only the example provider. Use a base URL such as `https://openrouter.ai/api/v1`, without `/chat/completions`. The server loads the file at startup; exported environment values override it. Missing credentials disable summaries while chat stays available. `.env` is ignored by Git, and the key is never sent to chat clients or included in logs. Restart the server after changing configuration.
 
 ## Run the Tkinter client
 
@@ -44,7 +44,7 @@ Opening a room loads its latest 20 messages. **Load older (20)** fetches the nex
 
 Only the active room is cached in client memory. Switching rooms clears that cache, fetches history again, and ignores replies belonging to an earlier room generation. Send acknowledgements do not append messages or advance the history cursor; the next sync supplies the complete ordered update. A send error retains the input for correction. Private messages remain stored when the other participant is offline, and rooms, memberships, and messages survive a server restart using the same database.
 
-This milestone sends human messages only; AI and sound remain planned. Hearts and pins are persisted and synchronized through room revisions and paginated snapshots.
+Human and AI messages share history, hearts and pins; sound remains planned. Hearts and pins are persisted and synchronized through room revisions and paginated snapshots.
 
 ## Group conversations
 
@@ -64,6 +64,14 @@ Actual heart/pin changes advance one persistent `room_revision`; repeated desire
 
 Existing database files are upgraded automatically at server startup by adding the heart table and missing pin column. Users, rooms, memberships and messages are retained. Heart/pin state survives restart. Non-members cannot mutate or read snapshots.
 
+## AI summaries
+
+Open a conversation and choose **Summarize**. The server selects up to 50 latest human messages, copies them in chronological order and acknowledges a new job immediately. Each request runs on its own API thread, so chatting and other summary requests continue while it waits. Previous AI summaries are excluded from the input.
+
+Successful output appears as an **AI** message for every member through normal polling. The database retains the actual returned model, job ID and last human source ID. AI messages have no human sender account and can be hearted or pinned. Provider failures appear only to the requester in Activity, without creating error messages in the room. Running jobs are checked every 3 seconds.
+
+A socket wait times out after 30 seconds and the worker enforces a 60-second job deadline. Late or duplicate results are not saved. Completed job statuses expire after an hour or server restart; successful AI messages remain in history. Requests are never automatically retried or switched to another model. In-flight HTTPS cannot be interrupted by urllib: daemon API threads may finish after server shutdown, and their results are discarded.
+
 ## Username identity
 
 Usernames contain 3-32 ASCII letters, digits, or underscores, without spaces. The first join creates the user; later joins match case-insensitively and reuse its ID while retaining its original spelling. IDs survive server restarts when the same database file is used. Multiple connections may use the same identity, as previously agreed.
@@ -78,7 +86,7 @@ This is identification by name, not password authentication: anyone entering an 
 python3 -m unittest discover -s tests -v
 ```
 
-Client logic tests run without a display or TCP sockets. GUI tests skip when no display is available. TCP tests require permission to open localhost sockets. Unicode fixtures use escape sequences in source files while still exercising multibyte UTF-8 data at runtime.
+AI tests use mocked providers and temporary environment files, without loading the real `.env` or making external requests. Client logic tests run without a display or TCP sockets. GUI tests skip when no display is available. TCP tests require permission to open localhost sockets. Unicode fixtures use escape sequences in source files while still exercising multibyte UTF-8 data at runtime.
 
 ## Local documentation
 
@@ -111,10 +119,11 @@ The links in the following tables refer to ignored files available in the develo
 
 ```text
 socket-chat/
-|-- .env.example             # Example OpenRouter endpoint, model and API key
+|-- .env.example             # OpenAI-compatible base URL, model and API key
 |-- .gitignore
 |-- README.md
 |-- server.py                # Lifecycle, queue, application worker and handlers
+|-- server_ai.py             # Private configuration and OpenAI-compatible HTTP
 |-- server_network.py        # TCP listener, connection threads and framing
 |-- database.py              # Worker-owned SQLite users, rooms and messages
 |-- client.py                # Tkinter widgets, callbacks and rendering
@@ -133,13 +142,15 @@ socket-chat/
     |-- test_login.py
     |-- test_protocol.py
     |-- test_reactions.py
-    `-- test_server.py
+    |-- test_server.py
+    |-- test_server_ai.py
+    `-- test_summaries.py
 ```
 
 Server responsibilities are split explicitly: `server_network.py` owns accept/recv/send, framing and connection deadlines; `server.py` owns the bounded work queue, sessions, application handlers and the SQLite worker. Transport calls `submit(request, session)` and returns its response on the same connection. Both share a shutdown Event so pending response waits can exit. Startup initializes storage before opening the listener; shutdown closes transport before joining the database worker.
 
-The server and client are separate files as required by the assignment. The current server implements ping, username-only login, logout, get_directory, open_private, create_group, join_group, send_message, sync_room, get_room_snapshot, set_heart, set_pin, and transport error responses. The directory returns all groups with their members, including groups the caller has not joined. Known application actions without handlers return `ACTION_NOT_IMPLEMENTED`; this is not a complete implementation of Protocol v1.1.
+The server and client are separate files as required by the assignment. The current server implements ping, username-only login, logout, get_directory, open_private, create_group, join_group, send_message, sync_room, get_room_snapshot, set_heart, set_pin, request_summary, get_summary_status, and transport error responses. The directory returns all groups with their members, including groups the caller has not joined. Known application actions without handlers return `ACTION_NOT_IMPLEMENTED`; this is not a complete implementation of Protocol v1.1.
 
 Local documentation distinguishes **confirmed**, **proposed**, and **unresolved** decisions. Confirming a design does not prove that it has been implemented or tested.
 
-Protocol v1.1 and the action contracts were specified by the assistant at the user's request as a shared API standard. Decisions outside that contract, such as the remaining room/message SQL schema and AI model selector, remain in Open decisions.
+Protocol v1.1 and the action contracts were specified by the assistant at the user's request as a shared API standard. Decisions outside that contract, such as sound playback and Docker packaging, remain in Open decisions.

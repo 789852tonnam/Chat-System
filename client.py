@@ -10,6 +10,11 @@ from tkinter.scrolledtext import ScrolledText
 from client_logic import ClientLogic
 
 
+# AI output has no human sender account, but shares the same message widgets.
+def _sender_name(message: dict) -> str:
+    return "AI" if message["sender_kind"] == "ai" else message["sender"]["username"]
+
+
 class ClientWindow(tk.Tk):
     """Read and update widgets on the main thread; delegate actions to logic."""
 
@@ -158,7 +163,9 @@ class ClientWindow(tk.Tk):
         self.heart_button.pack(side="left")
         self.pin_button = ttk.Button(message_actions, text="Pin message", command=self._pin_selected)
         self.pin_button.pack(side="left", padx=6)
-        ttk.Label(message_actions, textvariable=self.selection_title, wraplength=260).pack(side="left")
+        self.summary_button = ttk.Button(message_actions, text="Summarize", command=self.logic.request_summary)
+        self.summary_button.pack(side="left", padx=(0, 6))
+        ttk.Label(message_actions, textvariable=self.selection_title, wraplength=180).pack(side="left")
         # Message input remains separate from read-only history and diagnostic logs.
         composer = ttk.Frame(conversation)
         composer.grid(row=4, column=0, sticky="ew", pady=8)
@@ -249,7 +256,7 @@ class ClientWindow(tk.Tk):
                                     text="Unheart" if message and message["hearted_by_me"] else "Heart")
         self.pin_button.configure(state="normal" if enabled else "disabled")
         self.unpin_button.configure(state="normal" if self.logic.pinned_message is not None and self.logic.state == "connected" else "disabled")
-        self.selection_title.set(f"Selected: {message['sender']['username']}: {message['content'][:35].replace(chr(10), ' ')}"
+        self.selection_title.set(f"Selected: {_sender_name(message)}: {message['content'][:35].replace(chr(10), ' ')}"
                                  if message else "Click a message to select")
 
     # Request cancellation while leaving Tkinter free to show cleanup progress.
@@ -312,7 +319,7 @@ class ClientWindow(tk.Tk):
     # A layout change keeps the visible history anchor or the bottom position.
     def _render_pin(self) -> None:
         pinned = self.logic.pinned_message
-        text = f"Pinned - {pinned['sender']['username']}: {pinned['content']}" if pinned else ""
+        text = f"Pinned - {_sender_name(pinned)}: {pinned['content']}" if pinned else ""
         if self.pin_text.get("1.0", "end-1c") == text:
             return
         top = self.chat.index("@0,0")
@@ -334,7 +341,7 @@ class ClientWindow(tk.Tk):
     def _render_messages(self, older: list[dict], had_messages: bool) -> None:
         top_line, top_column = (int(part) for part in self.chat.index("@0,0").split("."))
         at_bottom = self.chat.yview()[1] >= 0.999
-        prepend_lines = sum(f"{message['sender']['username']}: {message['content']}\n".count("\n") for message in older)
+        prepend_lines = sum(f"{_sender_name(message)}: {message['content']}\n".count("\n") for message in older)
         self.chat.configure(state="normal")
         self.chat.delete("1.0", "end")
         for tag in self.chat.tag_names():
@@ -343,7 +350,7 @@ class ClientWindow(tk.Tk):
         for message in sorted(self.logic.messages.values(), key=lambda item: item["id"]):
             start = self.chat.index("end-1c")
             heart = "\u2665" if message["hearted_by_me"] else "\u2661"
-            self.chat.insert("end", f"{message['sender']['username']}: {message['content']}  [{heart} {message['heart_count']}]\n")
+            self.chat.insert("end", f"{_sender_name(message)}: {message['content']}  [{heart} {message['heart_count']}]\n")
             tag = f"message-{message['id']}"
             self.chat.tag_add(tag, start, "end-1c")
             self.chat.tag_bind(tag, "<Button-1>", lambda event, message_id=message["id"]: self._select_message(message_id))
@@ -426,6 +433,7 @@ class ClientWindow(tk.Tk):
             "creating": "Creating group...",
             "sending": "Sending message...",
             "updating": "Updating message...", "reloading": "Refreshing room state...",
+            "requesting_summary": "Requesting AI summary...", "checking_summary": "Checking AI summary...",
             "connected": f"Joined as {self.logic.user['username']}" if self.logic.user else "Connected",
         }.get(state, state.capitalize()))
         self.connect_button.configure(state="normal" if state == "disconnected" else "disabled")
@@ -440,6 +448,7 @@ class ClientWindow(tk.Tk):
         self.group_name_entry.configure(state="normal" if active and state != "creating" else "disabled")
         can_send = active and self.logic.room is not None and state == "connected"
         self.send_button.configure(state="normal" if can_send else "disabled")
+        self.summary_button.configure(state="normal" if can_send else "disabled")
         self.older_button.configure(state="normal" if can_send and self.logic.has_more_older else "disabled")
         self.message_input.configure(state="normal" if active and self.logic.room is not None and state != "sending" else "disabled")
         entry_state = "normal" if state == "disconnected" else "readonly"

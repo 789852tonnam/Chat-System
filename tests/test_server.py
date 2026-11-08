@@ -199,7 +199,7 @@ class ServerTests(unittest.TestCase):
         for request_id, action, payload, code in [
             (1, "unknown", {}, "UNKNOWN_ACTION"),
             (2, "ping", {"extra": 1}, "INVALID_PAYLOAD"),
-            (3, "request_summary", {"room_key": "private:1:2"}, "ACTION_NOT_IMPLEMENTED"),
+            (3, "trigger_effect", {"room_key": "private:1:2"}, "ACTION_NOT_IMPLEMENTED"),
         ]:
             peer.send(request_id, action, payload)
             response = peer.read()

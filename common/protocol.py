@@ -201,6 +201,21 @@ def validate_group_name(name: Any) -> str:
     return name.strip()
 
 
+# Keep provider/model metadata bounded and free of control characters.
+def validate_model_id(value: Any) -> str:
+    if (type(value) is not str or not value.strip() or len(value) > 200
+            or any(unicodedata.category(char) in {"Cc", "Cs"} for char in value)):
+        raise ProtocolError("INVALID_PAYLOAD", "Invalid model ID")
+    return value
+
+
+# Job IDs are canonical UUID strings, independent of a TCP connection's IDs.
+def validate_job_id(value: Any) -> str:
+    if type(value) is not str or re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", value) is None:
+        raise ProtocolError("INVALID_PAYLOAD", "Invalid summary job ID")
+    return value
+
+
 # Validate action-specific IDs without accepting bool, float, or numeric strings.
 # Zero is reserved for empty-history cursors and revision counters.
 def validate_id(value: Any, field: str, *, zero: bool = False) -> int:
@@ -346,22 +361,71 @@ def validate_room(room: Any) -> dict[str, Any]:
     return room
 
 
-# Validate the human-message format implemented by the current chat milestone.
-# Heart state is viewer-specific; AI fields retain their empty state for now.
+# Validate human or AI messages, including persisted model/job/source metadata.
+# AI has no user account; both kinds share viewer-specific heart and pin state.
 def validate_message(message: Any, room_key: str) -> dict[str, Any]:
     if (type(message) is not dict or not {"id", "room_key", "sender_kind", "sender", "content", "created_at",
                                         "heart_count", "hearted_by_me", "ai"} <= message.keys()
             or message.get("room_key") != room_key):
         raise ProtocolError("INVALID_RESPONSE", "Message belongs to an unexpected room")
     validate_id(message.get("id"), "message.id")
-    validate_user(message.get("sender"))
+    if message.get("sender_kind") == "human":
+        validate_user(message.get("sender"))
+        if message.get("ai") is not None:
+            raise ProtocolError("INVALID_RESPONSE", "Human messages cannot contain AI metadata")
+    elif message.get("sender_kind") == "ai":
+        metadata = message.get("ai")
+        if message.get("sender") is not None or type(metadata) is not dict:
+            raise ProtocolError("INVALID_RESPONSE", "AI messages require metadata and no human sender")
+        validate_model_id(metadata.get("model"))
+        validate_job_id(metadata.get("summary_job_id"))
+        source = validate_id(metadata.get("source_last_message_id"), "source_last_message_id")
+        if source >= message["id"]:
+            raise ProtocolError("INVALID_RESPONSE", "AI source must precede its result")
+    else:
+        raise ProtocolError("INVALID_RESPONSE", "Invalid message sender kind")
     if validate_content(message.get("content")) != message["content"]:
         raise ProtocolError("INVALID_RESPONSE", "Message content must already use normalized newlines")
-    if (message.get("sender_kind") != "human" or type(message.get("created_at")) is not str
-            or message.get("ai") is not None):
+    if type(message.get("created_at")) is not str:
         raise ProtocolError("INVALID_RESPONSE", "Invalid message fields")
     _validate_heart_fields(message)
     return message
+
+
+# Summary acknowledgements identify independent running jobs, never chat cursors.
+def validate_summary_ack(data: dict) -> None:
+    validate_job_id(data.get("job_id"))
+    if data.get("state") != "running":
+        raise ProtocolError("INVALID_RESPONSE", "Summary acknowledgement must be running")
+
+
+# Require consistent terminal/running fields before showing a job's private status.
+def validate_summary_status(data: dict, job_id: str) -> None:
+    job = data.get("job")
+    required = {"job_id", "room_key", "state", "created_at", "completed_at", "result_message_id", "error"}
+    if type(job) is not dict or not required <= job.keys() or job["job_id"] != job_id:
+        raise ProtocolError("INVALID_RESPONSE", "Invalid summary job")
+    validate_job_id(job["job_id"])
+    validate_room_key(job["room_key"])
+    if type(job["created_at"]) is not str:
+        raise ProtocolError("INVALID_RESPONSE", "Invalid summary timestamp")
+    if job["state"] == "running":
+        if any(job[name] is not None for name in ("completed_at", "result_message_id", "error")):
+            raise ProtocolError("INVALID_RESPONSE", "Running summary contains terminal fields")
+    elif job["state"] == "succeeded":
+        validate_id(job["result_message_id"], "result_message_id")
+        if type(job["completed_at"]) is not str or job["error"] is not None:
+            raise ProtocolError("INVALID_RESPONSE", "Invalid successful summary state")
+    elif job["state"] == "failed":
+        error = job["error"]
+        if (type(job["completed_at"]) is not str or job["result_message_id"] is not None or type(error) is not dict
+                or error.get("code") not in ("AI_RATE_LIMITED", "AI_TIMEOUT", "AI_UNAVAILABLE", "AI_FAILED")
+                or type(error.get("message")) is not str):
+            raise ProtocolError("INVALID_RESPONSE", "Invalid failed summary state")
+        if "retry_after_seconds" in error:
+            validate_id(error["retry_after_seconds"], "retry_after_seconds", zero=True)
+    else:
+        raise ProtocolError("INVALID_RESPONSE", "Invalid summary state")
 
 
 # A viewer-owned heart must contribute to the non-negative total count.

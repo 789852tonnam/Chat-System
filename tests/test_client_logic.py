@@ -304,3 +304,78 @@ class ClientLogicTests(unittest.TestCase):
         self.assertEqual(set(self.logic.messages), {1})
         self.assertEqual(self.logic.room_revision, 0)
         self.assertTrue(self.network.requests.empty())
+
+    def test_summary_status_poll_is_independent_and_result_arrives_only_via_sync(self):
+        self.join()
+        self.open_room(self.sync(older=[self.message(1)], oldest=1, latest=1))
+        self.logic._next_directory_poll = self.logic._next_room_poll = 200
+        job_id = "00000000-0000-4000-8000-000000000001"
+        self.logic.request_summary()
+        self.assertEqual(self.take("request_summary"), {"room_key": "private:1:2"})
+        self.reply({"job_id": job_id, "state": "running"})
+        self.assertEqual(set(self.logic.messages), {1})
+        self.assertEqual(self.logic.state, "connected")
+        self.clock.return_value = 104
+        self.logic.poll()
+        self.assertEqual(self.take("get_summary_status"), {"job_id": job_id})
+        job = {"job_id": job_id, "room_key": "private:1:2", "state": "running"}
+        self.reply({"job": job})
+        self.assertTrue(self.network.requests.empty())
+        self.clock.return_value = 108
+        self.logic.poll()
+        self.take("get_summary_status")
+        self.reply({"job": {**job, "state": "succeeded", "result_message_id": 2}})
+        self.assertEqual(set(self.logic.messages), {1})
+        self.assertEqual(self.take("sync_room")["latest_id"], 1)
+        ai = {**self.message(2), "sender_kind": "ai", "sender": None,
+              "ai": {"model": "actual-model", "summary_job_id": job_id, "source_last_message_id": 1}}
+        self.reply(self.sync(newer=[ai], oldest=1, latest=2))
+        self.assertEqual(self.logic.messages[2]["sender_kind"], "ai")
+        self.assertFalse(self.logic._summary_jobs)
+
+    def test_summary_reply_after_room_switch_does_not_show_notice_in_new_room(self):
+        self.join()
+        self.open_room()
+        job_id = "00000000-0000-4000-8000-000000000001"
+        self.logic.request_summary()
+        self.take("request_summary")
+        self.logic.open_chat(3, "Carol")
+        self.events.clear()
+        self.reply({"job_id": job_id, "state": "running"})
+        self.take("open_private")
+        self.assertFalse(any(kind == "log" for kind, value in self.events))
+        private = {"room_key": "private:1:3", "kind": "private", "name": None,
+                   "members": [self.alice, {"id": 3, "username": "Carol"}]}
+        self.reply({"room": private, "created": True})
+        self.take("sync_room")
+        self.reply({**self.sync(), "room_key": private["room_key"]})
+        self.logic._next_directory_poll = self.logic._next_room_poll = 200
+        self.clock.return_value = 104
+        self.logic.poll()
+        self.take("get_summary_status")
+        self.events.clear()
+        self.reply({"job": {"job_id": job_id, "room_key": "private:1:2", "state": "failed",
+                            "error": {"code": "AI_FAILED", "message": "Old room failure"}}})
+        self.assertFalse(any(kind == "log" for kind, value in self.events))
+        self.assertEqual(self.logic.room, private)
+        self.assertEqual(self.logic.messages, {})
+
+    def test_status_busy_retries_without_losing_job_then_missing_job_stops_polling(self):
+        self.join()
+        self.open_room()
+        self.logic._next_directory_poll = self.logic._next_room_poll = 200
+        job_id = "00000000-0000-4000-8000-000000000001"
+        self.logic.request_summary()
+        self.take("request_summary")
+        self.reply({"job_id": job_id, "state": "running"})
+        self.clock.return_value = 104
+        self.logic.poll()
+        self.take("get_summary_status")
+        self.reply(error={"code": "SERVER_BUSY", "message": "Busy"})
+        self.assertIn(job_id, self.logic._summary_jobs)
+        self.clock.return_value = 108
+        self.logic.poll()
+        self.take("get_summary_status")
+        self.reply(error={"code": "SUMMARY_JOB_NOT_FOUND", "message": "Expired"})
+        self.assertNotIn(job_id, self.logic._summary_jobs)
+        self.assertTrue(self.network.requests.empty())

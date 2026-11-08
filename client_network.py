@@ -26,6 +26,8 @@ from common.protocol import (
     validate_sync_response,
     validate_snapshot_response,
     validate_id,
+    validate_summary_ack,
+    validate_summary_status,
     validate_user,
 )
 
@@ -112,7 +114,7 @@ class NetworkClient(threading.Thread):
                                 raise ProtocolError("INVALID_RESPONSE", "Invalid group join response")
                         elif action == "send_message" and response["ok"]:
                             message = validate_message(response["data"].get("message"), payload["room_key"])
-                            if message["sender"]["id"] != user_id:
+                            if message["sender_kind"] != "human" or message["sender"]["id"] != user_id:
                                 raise ProtocolError("INVALID_RESPONSE", "Message acknowledgement has an unexpected sender")
                         elif action == "sync_room" and response["ok"]:
                             validate_sync_response(response["data"], payload)
@@ -126,6 +128,10 @@ class NetworkClient(threading.Thread):
                                     raise ProtocolError("INVALID_RESPONSE", "Stale snapshot must report a different revision")
                         elif action in {"set_heart", "set_pin"} and response["ok"]:
                             validate_mutation_response(response["data"], payload, action)
+                        elif action == "request_summary" and response["ok"]:
+                            validate_summary_ack(response["data"])
+                        elif action == "get_summary_status" and response["ok"]:
+                            validate_summary_status(response["data"], payload["job_id"])
                         self.events.put(("response", response))
         except (OSError, ProtocolError, FrameTooLarge, ValueError) as exc:
             if not self._stopping.is_set():

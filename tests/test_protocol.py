@@ -326,3 +326,36 @@ class SnapshotValidationTests(unittest.TestCase):
         for change in [{"reload_required": False}, {"room_revision": 2}, {"latest_id": 13}]:
             with self.assertRaises(ProtocolError):
                 validate_sync_response({**data, **change}, request)
+
+
+class SummaryValidationTests(unittest.TestCase):
+    def test_ai_message_requires_no_user_and_valid_source_model_job(self):
+        from common.protocol import validate_message
+        message = {"id": 8, "room_key": "private:1:2", "sender_kind": "ai", "sender": None,
+                   "content": "Summary", "created_at": "now", "heart_count": 1, "hearted_by_me": True,
+                   "ai": {"model": "actual-model", "summary_job_id": "00000000-0000-4000-8000-000000000001", "source_last_message_id": 4}}
+        validate_message(message, message["room_key"])
+        for change in [{"sender": {"id": 1, "username": "Alice"}}, {"ai": None},
+                       {"ai": {**message["ai"], "source_last_message_id": 8}},
+                       {"ai": {**message["ai"], "summary_job_id": "bad"}},
+                       {"ai": {**message["ai"], "model": "bad\nmodel"}}]:
+            with self.subTest(change=change), self.assertRaises(ProtocolError):
+                validate_message({**message, **change}, message["room_key"])
+
+    def test_job_ack_and_status_fields_must_agree_with_state(self):
+        from common.protocol import validate_summary_ack, validate_summary_status
+        job_id = "00000000-0000-4000-8000-000000000001"
+        validate_summary_ack({"job_id": job_id, "state": "running"})
+        with self.assertRaises(ProtocolError):
+            validate_summary_ack({"job_id": job_id, "state": "succeeded"})
+        job = {"job_id": job_id, "room_key": "private:1:2", "state": "running", "created_at": "now",
+               "completed_at": None, "result_message_id": None, "error": None}
+        validate_summary_status({"job": job}, job_id)
+        validate_summary_status({"job": {**job, "state": "succeeded", "completed_at": "later", "result_message_id": 8}}, job_id)
+        validate_summary_status({"job": {**job, "state": "failed", "completed_at": "later",
+                                        "error": {"code": "AI_RATE_LIMITED", "message": "Later", "retry_after_seconds": 5}}}, job_id)
+        for change in [{"job_id": "bad"}, {"state": "other"}, {"result_message_id": 1},
+                       {"state": "succeeded", "completed_at": "later", "result_message_id": True},
+                       {"state": "failed", "completed_at": "later", "error": {"code": "AI_FAILED", "message": "Oops", "retry_after_seconds": True}}]:
+            with self.subTest(change=change), self.assertRaises(ProtocolError):
+                validate_summary_status({"job": {**job, **change}}, job_id)
