@@ -1,0 +1,11 @@
+# Allow only the build recipe and server source into the build context.
+**
+!Dockerfile
+!.dockerignore
+!server.py
+!server_network.py
+!server_ai.py
+!database.py
+!common/
+!common/__init__.py
+!common/protocol.py

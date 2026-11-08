@@ -2,7 +2,7 @@
 
 A Computer Network term project using Python, Tkinter, and TCP sockets. The planned application includes private chats, group chats, and four additional features.
 
-**Current status:** The server and Tkinter client support username-only entry, persistent user IDs, a live online directory, private and group chat with persistent history, message hearts, a single room pin, AI summaries, room sound playback, connection management, and ping. All 200 tests passed, including SQLite persistence, real TCP loopback, and Tkinter UI tests. Docker images and the two-physical-computer demonstration remain pending.
+**Current status:** The server and Tkinter client support username-only entry, persistent user IDs, a live online directory, private and group chat with persistent history, message hearts, a single room pin, AI summaries, room sound playback, connection management, and ping. All 200 tests passed, including SQLite persistence, real TCP loopback, and Tkinter UI tests. A server-only Docker image is available; cloud deployment and the two-physical-computer demonstration remain pending.
 
 ## Run the server
 
@@ -14,9 +14,43 @@ python3 server.py --host 127.0.0.1 --port 5000
 
 The server creates `data/chat.sqlite3` for persistent users. Choose another file with `--database PATH`, or use `--database :memory:` for temporary storage. The runtime `data/` directory is ignored by Git.
 
-Press Ctrl-C to stop the server. For LAN connections, bind the server to `0.0.0.0` and allow access to its TCP port. See the local [Server guide](docs/server.md) for ping examples and the thread/queue flow.
+Press Ctrl-C to stop the server. For LAN connections, bind the server to `0.0.0.0` and allow access to its TCP port.
 
 For AI summaries, copy [.env.example](.env.example) to `.env` beside `server.py` and fill `OPENAI_BASE_URL`, `OPENAI_MODEL` and `OPENAI_API_KEY`. These names configure an OpenAI-compatible API; OpenRouter is only the example provider. Use a base URL such as `https://openrouter.ai/api/v1`, without `/chat/completions`. The server loads the file at startup; exported environment values override it. Missing credentials disable summaries while chat stays available. `.env` is ignored by Git, and the key is never sent to chat clients or included in logs. Restart the server after changing configuration.
+
+## Run the server in Docker
+
+From the socket-chat directory, build and start the server:
+
+```bash
+docker build --tag socket-chat-server:latest .
+docker run --detach --name socket-chat-server \
+  --publish 5000:5000 \
+  --mount type=volume,source=socket-chat-data,target=/data \
+  socket-chat-server:latest
+```
+
+The image runs as UID/GID 10001 and contains only server modules. [.dockerignore](.dockerignore) allows only the server source/build files into the build context; `.env`, local databases, clients and sound assets are excluded. To enable AI, add `--env-file .env` before the image name in the run command after preparing your private configuration. Docker supplies those values at runtime; the image does not contain the key. Without configuration, chat works and AI summaries are disabled.
+
+The named volume stores `/data/chat.sqlite3` separately from the container and is reused when recreating it. It starts with a new database; an existing host `data/chat.sqlite3` is not imported automatically. Use the same volume name to retain users, rooms, messages, hearts and pins. Sound counters and pending AI jobs are temporary and reset on restart.
+
+```bash
+docker logs socket-chat-server
+docker stop socket-chat-server
+docker start socket-chat-server
+```
+
+The [Dockerfile](Dockerfile) uses an exec-form entry point and `SIGINT` for stop, matching the server's existing cleanup path. See the [Dockerfile reference](https://docs.docker.com/reference/dockerfile/) and [volume lifecycle](https://docs.docker.com/engine/storage/volumes/) for these Docker behaviors.
+
+Clients run normally on their own computers. On the Docker host, connect to `127.0.0.1:5000`; another LAN computer uses the host's LAN IP and port 5000. Allow that TCP port through the host firewall. To use another host port, change the mapping to e.g. `--publish 5001:5000` and connect clients to port 5001. Container port 5000 stays the same. A LAN demonstration needs no router port forwarding; cloud hosting is a separate deployment step.
+
+After building, run the isolated container check:
+
+```bash
+python3 tests/check_docker.py
+```
+
+It uses synthetic users/messages and fake runtime AI configuration, never the real `.env` or an external API. It checks the non-root/server-only image, published TCP, users/groups/members/history/hearts/pin persistence after container recreation and graceful shutdown, then removes its own temporary containers/volume. The image remains available. This container check passed, and all 122 server/protocol tests also passed inside the image with a read-only tests mount. The prior full host suite passed 200 tests; GUI behavior has not been demonstrated on two physical computers.
 
 ## Run the Tkinter client
 
@@ -33,8 +67,6 @@ Enter a username, select **Join**, then **Send Ping**, and check Activity for th
 The online list includes your own name, marked `(you)`, and shows each user once even when that identity has multiple connections. It refreshes immediately after Join, then every 3 seconds after a snapshot returns. Polls wait for any request already in flight and never accumulate. During background refreshes, action buttons stay available; one clicked command waits for the current response, then runs before further polling. Disconnect and window close remain available. Selection is preserved for users who remain online.
 
 Logging out or closing the last connection removes that user from later snapshots. Disconnected sessions are removed by the server worker before requests and during idle maintenance; stored users remain in SQLite. Background polling keeps healthy idle clients active. If a connection fails, the client reports the error and clears the online list. Reconnect explicitly with **Join**. Requests are never retried automatically.
-
-See the local [Client guide](docs/client.md) for details. The `docs/`, `diagram/`, and `GLOSSARY.md` paths are ignored by Git and exist only in the development workspace; they are not included in a Git checkout.
 
 ## Private chat
 
@@ -84,7 +116,7 @@ Playback launches asynchronously. A new event restarts the same clip rather than
 
 ## Username identity
 
-Usernames contain 3-32 ASCII letters, digits, or underscores, without spaces. The first join creates the user; later joins match case-insensitively and reuse its ID while retaining its original spelling. IDs survive server restarts when the same database file is used. Multiple connections may use the same identity, as previously agreed.
+Usernames contain 3-32 ASCII letters, digits, or underscores, without spaces. The first join creates the user; later joins match case-insensitively and reuse its ID while retaining its original spelling. IDs survive server restarts when the same database file is used. Multiple connections may use the same identity.
 
 This is identification by name, not password authentication: anyone entering an existing username can use that identity. The server binds the chosen user to its connection and does not accept a user ID supplied by the client as proof of identity.
 
@@ -98,39 +130,14 @@ python3 -m unittest discover -s tests -v
 
 Automated audio tests mock player processes and do not make noise. AI tests use mocked providers and temporary environment files, without loading the real `.env` or making external requests. Client logic tests run without a display or TCP sockets. GUI tests skip when no display is available. TCP tests require permission to open localhost sockets. Unicode fixtures use escape sequences in source files while still exercising multibyte UTF-8 data at runtime.
 
-## Local documentation
-
-The links in the following tables refer to ignored files available in the development workspace.
-
-| Document | Purpose |
-| --- | --- |
-| [Requirements and acceptance criteria](docs/requirements.md) | R1-R11, grading, demonstration evidence, and submission materials |
-| [Design overview](docs/design.md) | Agreed behavior and component responsibilities |
-| [Implementation plan](docs/implementation-plan.md) | Milestones from connectivity to the two-computer demonstration |
-| [Open decisions](docs/open-decisions.md) | Proposals and unresolved details, separate from confirmed decisions |
-| [Implemented server](docs/server.md) | Running the server, testing ping, and understanding its execution flow |
-| [Glossary](GLOSSARY.md) | Shared terminology for accounts, rooms, memberships, and pins |
-
-## Detailed references and diagrams
-
-| Topic | Documentation | PlantUML |
-| --- | --- | --- |
-| Client/server threads, queues, and responsibilities | [Design](docs/design.md) | [Architecture](diagram/architecture.puml) |
-| Data structures | [Data model](docs/data-model.md) | [Database](diagram/database.puml) |
-| TCP request/response | [Protocol](docs/protocol.md) | - |
-| Action contracts and JSON examples | [API reference](docs/api-reference.md), [Examples](docs/protocol-examples.json) | - |
-| Polling, history, and revisions | [Synchronization](docs/synchronization.md) | - |
-| AI, hearts, pins, and a room-wide rimshot sound button | [Special features](docs/special-features.md) | - |
-| OpenRouter and free models | [AI](docs/ai.md) | - |
-| LAN, Docker, and persistent data | [Deployment](docs/deployment.md) | [Deployment](diagram/deployment.puml) |
-| Assignment, template, and submission instructions | [References](docs/references/README.md) | - |
-
 ## Current project structure
 
 ```text
 socket-chat/
 |-- .env.example             # OpenAI-compatible base URL, model and API key
+|-- .dockerignore            # Server-only Docker build context allowlist
 |-- .gitignore
+|-- Dockerfile               # Non-root TCP server with persistent /data mount
 |-- README.md
 |-- server.py                # Lifecycle, queue, application worker and handlers
 |-- server_ai.py             # Private configuration and OpenAI-compatible HTTP
@@ -146,6 +153,7 @@ socket-chat/
 |   |-- __init__.py
 |   `-- protocol.py          # Shared wire-format helpers
 `-- tests/                   # Protocol, headless logic, TCP and Tkinter tests
+    |-- check_docker.py       # Explicit container, persistence and shutdown check
     |-- test_chat.py
     |-- test_client_audio.py
     |-- test_client_logic.py
@@ -165,7 +173,3 @@ socket-chat/
 Server responsibilities are split explicitly: `server_network.py` owns accept/recv/send, framing and connection deadlines; `server.py` owns the bounded work queue, sessions, application handlers and the SQLite worker. Transport calls `submit(request, session)` and returns its response on the same connection. Both share a shutdown Event so pending response waits can exit. Startup initializes storage before opening the listener; shutdown closes transport before joining the database worker.
 
 The server and client are separate files as required by the assignment. The current server implements ping, username-only login, logout, get_directory, open_private, create_group, join_group, send_message, sync_room, get_room_snapshot, set_heart, set_pin, request_summary, get_summary_status, trigger_effect, and transport error responses. The directory returns all groups with their members, including groups the caller has not joined. All 15 protocol actions now have handlers; unknown actions return `UNKNOWN_ACTION`. Deployment and assignment demonstration checks remain separate from local implementation tests.
-
-Local documentation distinguishes **confirmed**, **proposed**, and **unresolved** decisions. Confirming a design does not prove that it has been implemented or tested.
-
-Protocol v1.1 and the action contracts were specified by the assistant at the user's request as a shared API standard. Decisions outside that contract, such as Docker packaging and demonstration setup, remain in Open decisions.
